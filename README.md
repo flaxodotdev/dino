@@ -4,7 +4,7 @@ Authentic recreation of the Chrome offline dino runner (`chrome://dino`) for you
 
 [![zig](https://img.shields.io/badge/zig-0.16-yellow)](https://ziglang.org)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![release](https://img.shields.io/badge/release-0.0.1-green)](https://github.com/Flaxo/dino/releases/tag/v0.0.1)
+[![release](https://img.shields.io/badge/release-0.0.1-green)](https://github.com/flaxodotdev/dino/releases/tag/v0.0.1)
 
 ## Features — chrome parity
 
@@ -15,8 +15,15 @@ Authentic recreation of the Chrome offline dino runner (`chrome://dino`) for you
 
 ## Install
 
+**One-liner (recommended):**
 ```bash
-# from source
+curl -fsSL https://raw.githubusercontent.com/flaxodotdev/dino/master/install.sh | sh
+# custom prefix/version:
+curl -fsSL https://raw.githubusercontent.com/flaxodotdev/dino/master/install.sh | sh -s -- --prefix ~/.local --version 0.0.1
+```
+
+**From source:**
+```bash
 zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/dino
 # or

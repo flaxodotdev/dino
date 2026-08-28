@@ -76,5 +76,6 @@
         "src",
         "LICENSE",
         "README.md",
+        "install.sh",
     },
 }
