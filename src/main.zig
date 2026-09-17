@@ -10,12 +10,11 @@ const FPS: u64 = 60;
 const FRAME_NS: u64 = 1_000_000_000 / FPS;
 const DINO_X: i32 = 6; // fixed column where dino lives
 
-// Physics are authored for the full scale dino (20 pixels tall) and are
-// multiplied by Game.scale() when the half scale sprites are in use.
-// peak = v^2 / (2g) = 2.30^2 / 0.22 ~= 24 px  (1.2x the dino, like chrome)
-// airtime = 2v/g ~= 42 frames ~= 0.7s
-const BASE_GRAVITY: f32 = 0.11;
-const BASE_JUMP_VEL: f32 = -2.30;
+// Physics are authored for the full scale dino (20 pixels tall).
+// peak = v^2 / (2g) = 3.0^2 / 0.18 ~= 25 px  (1.25x the dino)
+// airtime = 2v/g ~= 33 frames ~= 0.55s
+const BASE_GRAVITY: f32 = 0.18;
+const BASE_JUMP_VEL: f32 = -3.0;
 const BASE_DROP_ACC: f32 = 0.45; // extra gravity while fast-dropping
 
 // chrome runs at 6 px/frame with a 44 px wide dino and tops out at 13.
@@ -516,11 +515,13 @@ const Game = struct {
     }
 
     fn gravity(self: *Game) f32 {
-        return BASE_GRAVITY * self.scale();
+        _ = self;
+        return BASE_GRAVITY;
     }
 
     fn jumpVel(self: *Game) f32 {
-        return BASE_JUMP_VEL * self.scale();
+        _ = self;
+        return BASE_JUMP_VEL;
     }
 
     /// Narrow terminals show fewer dino-widths than chrome's canvas, so the
@@ -624,8 +625,8 @@ const Game = struct {
         if (o.kind != .ptero) return bottom - h + 1;
         const lift: i32 = switch (o.level) {
             .low => 0,
-            .mid => @intFromFloat(6 * self.scale()),
-            .high => @intFromFloat(12 * self.scale()),
+            .mid => 6,
+            .high => 12,
         };
         return bottom - lift - h + 1;
     }
@@ -751,7 +752,8 @@ const Game = struct {
                 o.count = if (roll < 20) 1 else if (roll < 35) 2 else 3;
             } else {
                 o.kind = .cactus_large;
-                o.count = if (roll < 65) 1 else if (roll < 85) 2 else 3;
+                // Reduce likelihood of 3 large cacti (they're too wide to clear)
+                o.count = if (roll < 70) 1 else if (roll < 90) 2 else 3;
             }
         }
         self.obstacles.append(self.allocator, o) catch {};
@@ -761,7 +763,9 @@ const Game = struct {
         const span = @max(0.001, self.maxSpeed() - self.baseSpeed());
         const t = std.math.clamp((self.speed - self.baseSpeed()) / span, 0, 1);
         const raw: f32 = @floatFromInt(r.intRangeAtMost(i32, 55, 110));
-        const gap_frames = @max(44.0, raw * (1.0 - 0.32 * t));
+        // Increase gap for wider obstacles to give more reaction time
+        const width_bonus: f32 = if (o.count >= 3) 15.0 else if (o.count == 2) 8.0 else 0.0;
+        const gap_frames = @max(44.0, (raw + width_bonus) * (1.0 - 0.32 * t));
         self.next_spawn_dist = self.speed * gap_frames;
         self.dist_since_spawn = 0;
     }
@@ -797,7 +801,7 @@ const Game = struct {
             self.jumps += 1;
         }
         if (!self.on_ground and duck_down) {
-            self.dino_vy += BASE_DROP_ACC * self.scale();
+            self.dino_vy += BASE_DROP_ACC;
         }
 
         if (!self.on_ground) {
@@ -938,8 +942,8 @@ fn rectsOverlap(a: Rect, b: Rect) bool {
 // ---------------------------------------------------------------------------
 // Terminal helpers
 // ---------------------------------------------------------------------------
-const STDIN_FD: posix.fd_t = 0;
-const STDOUT_FD: posix.fd_t = 1;
+const STDIN_FD: i32 = 0;
+const STDOUT_FD: i32 = 1;
 
 fn nowNs() i128 {
     var ts: c.timespec = undefined;
@@ -1450,7 +1454,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = gpa.allocator();
 
     {
-        var args = std.process.Args.Iterator.init(init.args);
+        var args = std.process.Args.init(alloc, init.args);
+        defer args.deinit();
         _ = args.next(); // argv[0]
         if (args.next()) |cmd| {
             if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "stats")) return viewHistory(alloc);
