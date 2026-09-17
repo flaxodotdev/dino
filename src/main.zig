@@ -363,7 +363,6 @@ const Game = struct {
     dino_vy: f32 = 0,
     on_ground: bool = true,
     ducking: bool = false,
-    duck_timer: i32 = 0,
     frame: u64 = 0,
     score: u32 = 0,
     hi_score: u32 = 0,
@@ -541,7 +540,6 @@ const Game = struct {
         self.dino_vy = 0;
         self.on_ground = true;
         self.ducking = false;
-        self.duck_timer = 0;
         self.frame = 0;
         self.score = 0;
         self.speed = self.baseSpeed();
@@ -604,19 +602,11 @@ const Game = struct {
         self.dist_since_spawn = 0;
     }
 
-    fn update(self: *Game, want_jump: bool, want_duck: bool, want_duck_hold: bool) void {
+    fn update(self: *Game, want_jump: bool, duck_down: bool) void {
         self.frame += 1;
         if (self.frame % 20 == 0) self.blink = !self.blink;
 
-        // terminal input has no key-up, so a duck lingers for a few frames
-        if (want_duck) self.duck_timer = 8;
-        if (self.duck_timer > 0) {
-            self.duck_timer -= 1;
-            self.ducking = want_duck or want_duck_hold or self.duck_timer > 4;
-        } else {
-            self.ducking = false;
-        }
-        if (!self.on_ground) self.ducking = false;
+        self.ducking = duck_down and self.on_ground;
 
         if (self.state == .idle) {
             self.ground_scroll += self.baseSpeed() * 0.5;
@@ -631,7 +621,7 @@ const Game = struct {
             self.dino_vy = self.jumpVel();
             self.on_ground = false;
         }
-        if (!self.on_ground and (want_duck or want_duck_hold)) {
+        if (!self.on_ground and duck_down) {
             self.dino_vy += BASE_DROP_ACC * self.scale();
         }
 
@@ -832,63 +822,140 @@ fn moveTo(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, row: i32, col: i32)
 
 // ---------------------------------------------------------------------------
 // Input
+//
+// A terminal reports no key-up events, so "is the duck key still held?" has to
+// be inferred from the keyboard's auto-repeat. The naive version - duck for a
+// few frames per keypress - stutters, because the terminal waits ~600ms before
+// the first repeat: duck, stand, duck.
+//
+// So the hold window is adaptive. The first press holds long enough to bridge
+// that delay; once repeats are actually arriving the window shrinks, so letting
+// go feels immediate. A release event is honoured if one ever shows up, but
+// nothing depends on it.
 // ---------------------------------------------------------------------------
+
+const DUCK_FIRST_MS: i128 = 800;
+const DUCK_REPEAT_MS: i128 = 200;
+
+// sentinels for keys that are not unicode code points
+const KEY_UP: u32 = 0xE000;
+const KEY_DOWN: u32 = 0xE001;
+
 const Input = struct {
     jump: bool = false,
-    duck: bool = false,
-    duck_hold: bool = false,
     quit: bool = false,
     restart: bool = false,
 };
 
-fn pollInput() Input {
+const InputState = struct {
+    duck_held: bool = false,
+    duck_expire: i128 = 0,
+};
+
+fn isCsiFinal(b: u8) bool {
+    return b >= 0x40 and b <= 0x7e;
+}
+
+fn parseU32(s: []const u8) u32 {
+    return std.fmt.parseInt(u32, s, 10) catch 0;
+}
+
+fn isDuckKey(code: u32) bool {
+    return code == KEY_DOWN or code == 's' or code == 'S' or code == 'j' or code == 'J';
+}
+
+fn isJumpKey(code: u32) bool {
+    return code == KEY_UP or code == ' ' or code == 'w' or code == 'W' or code == 'k' or code == 'K';
+}
+
+fn handleKey(st: *InputState, inp: *Input, code: u32, event: u32) void {
+    const released = event == 3;
+
+    if (isDuckKey(code)) {
+        if (released) {
+            st.duck_held = false;
+        } else {
+            const window: i128 = if (st.duck_held) DUCK_REPEAT_MS else DUCK_FIRST_MS;
+            st.duck_held = true;
+            st.duck_expire = nowNs() + window * 1_000_000;
+        }
+        return;
+    }
+
+    if (released) return;
+
+    // any other key means the duck key is not the one being held
+    st.duck_held = false;
+
+    if (isJumpKey(code)) {
+        inp.jump = true;
+    } else if (code == '\r' or code == '\n') {
+        inp.jump = true;
+        inp.restart = true;
+    } else if (code == 'q' or code == 'Q' or code == 3) {
+        inp.quit = true;
+    } else if (code == 'r' or code == 'R') {
+        inp.restart = true;
+    }
+}
+
+fn handleCsi(st: *InputState, inp: *Input, params: []const u8, final: u8) void {
+    if (params.len != 0 and (params[0] == '?' or params[0] == '>' or params[0] == '<')) return;
+
+    // "<key>;<mods>:<event>" - the event type, when present, is a sub-parameter
+    var event: u32 = 1;
+    var key: u32 = 0;
+    var parts = std.mem.splitScalar(u8, params, ';');
+    if (parts.next()) |p0| {
+        var subs = std.mem.splitScalar(u8, p0, ':');
+        key = parseU32(subs.next() orelse "");
+    }
+    if (parts.next()) |p1| {
+        var subs = std.mem.splitScalar(u8, p1, ':');
+        _ = subs.next();
+        if (subs.next()) |ev| event = parseU32(ev);
+    }
+
+    switch (final) {
+        'A' => handleKey(st, inp, KEY_UP, event),
+        'B' => handleKey(st, inp, KEY_DOWN, event),
+        'u' => handleKey(st, inp, key, event),
+        else => {},
+    }
+}
+
+fn pollInput(st: *InputState) Input {
     var inp = Input{};
     var fds = [_]posix.pollfd{.{ .fd = STDIN_FD, .events = posix.POLL.IN, .revents = 0 }};
     const n = posix.poll(&fds, 0) catch 0;
-    if (n == 0) return inp;
-    if (fds[0].revents & posix.POLL.IN == 0) return inp;
 
-    var buf: [64]u8 = undefined;
-    const read_n = posix.read(STDIN_FD, &buf) catch 0;
-    if (read_n == 0) return inp;
-    var i: usize = 0;
-    while (i < read_n) : (i += 1) {
-        const ch = buf[i];
-        switch (ch) {
-            3, // Ctrl-C
-            27,
-            => {
-                if (i + 2 < read_n and buf[i + 1] == '[') {
-                    const arrow = buf[i + 2];
-                    if (arrow == 'A') {
-                        inp.jump = true;
-                        i += 2;
-                    } else if (arrow == 'B') {
-                        inp.duck = true;
-                        inp.duck_hold = true;
-                        i += 2;
-                    } else if (arrow == 'C' or arrow == 'D') {
-                        i += 2;
-                    }
-                } else {
-                    inp.quit = true;
-                }
-            },
-            ' ', 'w', 'W', 'k', 'K' => inp.jump = true,
-            '\r', '\n' => {
-                inp.jump = true;
-                inp.restart = true;
-            },
-            's', 'S', 'j', 'J' => {
-                inp.duck = true;
-                inp.duck_hold = true;
-            },
-            'q', 'Q' => inp.quit = true,
-            'r', 'R' => inp.restart = true,
-            else => {},
+    if (n != 0 and fds[0].revents & posix.POLL.IN != 0) {
+        var buf: [128]u8 = undefined;
+        const read_n = posix.read(STDIN_FD, &buf) catch 0;
+        var i: usize = 0;
+        while (i < read_n) {
+            const ch = buf[i];
+            if (ch == 0x1b and i + 1 < read_n and buf[i + 1] == '[') {
+                var j = i + 2;
+                while (j < read_n and !isCsiFinal(buf[j])) : (j += 1) {}
+                if (j >= read_n) break; // truncated sequence, drop the tail
+                handleCsi(st, &inp, buf[i + 2 .. j], buf[j]);
+                i = j + 1;
+                continue;
+            }
+            // a lone ESC quits, but only when it is the whole read - otherwise
+            // it is the head of an escape sequence split across reads
+            if (ch == 0x1b and read_n == 1) {
+                inp.quit = true;
+                i += 1;
+                continue;
+            }
+            handleKey(st, &inp, ch, 1);
+            i += 1;
         }
-        if (ch == 'q' or ch == 'Q') inp.quit = true;
     }
+
+    if (st.duck_held and nowNs() > st.duck_expire) st.duck_held = false;
     return inp;
 }
 
@@ -1095,10 +1162,58 @@ fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+/// `DINO_KEYS=1 dino`: dump what the terminal actually sends, with timings. Exists
+/// because "the duck key sticks" can only be explained by the terminal, and
+/// that is invisible from inside the game loop.
+fn dumpKeys() !void {
+    const orig = enableRawMode() catch |e| {
+        std.debug.print("failed to enable raw mode: {any}\n", .{e});
+        return;
+    };
+    defer disableRawMode(orig);
+
+    var out: [4096]u8 = undefined;
+    const banner = "key dump - press keys (hold the duck key too), q to quit\r\n\r\n";
+    writeAll(STDOUT_FD, banner);
+
+    const start = nowNs();
+    while (true) {
+        var fds = [_]posix.pollfd{.{ .fd = STDIN_FD, .events = posix.POLL.IN, .revents = 0 }};
+        const n = posix.poll(&fds, 5000) catch 0;
+        if (n == 0) continue;
+
+        var buf: [128]u8 = undefined;
+        const read_n = posix.read(STDIN_FD, &buf) catch 0;
+        if (read_n == 0) continue;
+
+        const ms = @divTrunc(nowNs() - start, 1_000_000);
+        var w: usize = 0;
+        var line = try std.fmt.bufPrint(out[w..], "{d:>6}ms  {d:>2} bytes  ", .{ ms, read_n });
+        w += line.len;
+        for (buf[0..read_n]) |b| {
+            line = if (b == 0x1b)
+                try std.fmt.bufPrint(out[w..], "ESC ", .{})
+            else if (b >= 0x20 and b < 0x7f)
+                try std.fmt.bufPrint(out[w..], "{c} ", .{b})
+            else
+                try std.fmt.bufPrint(out[w..], "\\x{x:0>2} ", .{b});
+            w += line.len;
+        }
+        line = try std.fmt.bufPrint(out[w..], "\r\n", .{});
+        w += line.len;
+        writeAll(STDOUT_FD, out[0..w]);
+
+        if (std.mem.indexOfScalar(u8, buf[0..read_n], 'q') != null) break;
+    }
+    writeAll(STDOUT_FD, "\r\n");
+}
+
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+
+    if (c.getenv("DINO_KEYS") != null) return dumpKeys();
 
     const is_tty = c.isatty(STDIN_FD) != 0;
     if (!is_tty) {
@@ -1116,6 +1231,8 @@ pub fn main() !void {
         return;
     };
     defer disableRawMode(orig);
+
+    var input_state: InputState = .{};
 
     var tmp_buf: std.ArrayList(u8) = .empty;
     defer tmp_buf.deinit(alloc);
@@ -1152,10 +1269,8 @@ pub fn main() !void {
         if (delta < 0) delta = 0;
         acc += delta;
 
-        const inp = pollInput();
+        const inp = pollInput(&input_state);
         var jump = inp.jump;
-        var duck = inp.duck;
-        const duck_hold = inp.duck_hold;
 
         if (inp.quit) {
             running = false;
@@ -1181,9 +1296,8 @@ pub fn main() !void {
         }
 
         while (acc >= FRAME_NS) : (acc -= FRAME_NS) {
-            game.update(jump, duck, duck_hold);
+            game.update(jump, input_state.duck_held);
             jump = false;
-            duck = false;
         }
 
         try render(&game, &frame_buf);
