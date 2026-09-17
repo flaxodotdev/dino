@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
+const history = @import("history.zig");
 
 // ---------------------------------------------------------------------------
 // Config
@@ -417,6 +418,7 @@ const Obstacle = struct {
     kind: ObstacleKind,
     count: u8 = 1,
     level: PteroHeight = .low,
+    passed: bool = false, // already behind the dino, counted once
 };
 
 const Cloud = struct {
@@ -449,6 +451,15 @@ const Game = struct {
     flash_start: u64 = 0,
     flashing: bool = false,
     pending_beep: bool = false,
+    // per-run stats, written to the history file when the run ends
+    run_started: i64 = 0,
+    run_start_ns: i128 = 0,
+    run_active: bool = false,
+    pending_save: bool = false,
+    obstacles_passed: u32 = 0,
+    jumps: u32 = 0,
+    ducks: u32 = 0,
+    top_speed: f32 = 0,
     speed: f32 = 1,
     ground_scroll: f32 = 0,
     allocator: std.mem.Allocator,
@@ -661,6 +672,12 @@ const Game = struct {
         self.intro = 0;
         self.flashing = false;
         self.pending_beep = false;
+        self.run_active = false;
+        self.pending_save = false;
+        self.obstacles_passed = 0;
+        self.jumps = 0;
+        self.ducks = 0;
+        self.top_speed = 0;
         self.speed = self.baseSpeed();
         self.ground_scroll = 0;
         self.obstacles.clearRetainingCapacity();
@@ -675,11 +692,38 @@ const Game = struct {
         self.state = .idle;
     }
 
+    /// Chrome's speed in px/frame, so history from different terminal widths
+    /// can be compared.
+    fn chromeSpeed(self: *Game) f32 {
+        const px_per_col = CHROME_DINO_W / @as(f32, @floatFromInt(self.dinoW()));
+        return self.speed * px_per_col / self.widthScale();
+    }
+
     fn startRun(self: *Game) void {
         self.state = .playing;
         self.frame = 0;
         self.speed = self.baseSpeed();
         self.intro = INTRO_FRAMES;
+        self.run_started = unixNow();
+        self.run_start_ns = nowNs();
+        self.run_active = true;
+    }
+
+    /// Hand the finished run to the caller to persist. Safe to call twice.
+    fn takeRun(self: *Game, death: bool) ?history.Run {
+        if (!self.run_active) return null;
+        self.run_active = false;
+        const ms: i64 = @intCast(@divTrunc(nowNs() - self.run_start_ns, 1_000_000));
+        return .{
+            .started = self.run_started,
+            .ms = ms,
+            .score = self.score,
+            .obstacles = self.obstacles_passed,
+            .jumps = self.jumps,
+            .ducks = self.ducks,
+            .speed_x100 = @intFromFloat(@round(self.top_speed * 100)),
+            .death = death,
+        };
     }
 
     fn spawnCloud(self: *Game, at_x: i32) void {
@@ -726,7 +770,9 @@ const Game = struct {
         self.frame += 1;
         if (self.frame % 20 == 0) self.blink = !self.blink;
 
+        const was_ducking = self.ducking;
         self.ducking = duck_down and self.on_ground;
+        if (self.ducking and !was_ducking and self.state == .playing) self.ducks += 1;
 
         if (self.state == .idle) {
             self.ground_scroll += self.baseSpeed() * 0.5;
@@ -748,6 +794,7 @@ const Game = struct {
         if (want_jump and self.on_ground and !self.ducking) {
             self.dino_vy = self.jumpVel();
             self.on_ground = false;
+            self.jumps += 1;
         }
         if (!self.on_ground and duck_down) {
             self.dino_vy += BASE_DROP_ACC * self.scale();
@@ -766,6 +813,8 @@ const Game = struct {
         if (self.speed < self.maxSpeed()) {
             self.speed += self.baseSpeed() * ACCEL_RATIO;
         }
+        const cs = self.chromeSpeed();
+        if (cs > self.top_speed) self.top_speed = cs;
 
         // chrome counts round(distance * 0.025) in its own 44px-dino pixels;
         // normalising by widthScale keeps scores comparable across terminals
@@ -791,7 +840,14 @@ const Game = struct {
             self.spawnCloud(self.width + 2);
         }
 
-        for (self.obstacles.items) |*o| o.x -= self.speed;
+        const dino_left: f32 = @floatFromInt(self.dinoX());
+        for (self.obstacles.items) |*o| {
+            o.x -= self.speed;
+            if (!o.passed and o.x + @as(f32, @floatFromInt(self.obstacleW(o.*))) < dino_left) {
+                o.passed = true;
+                self.obstacles_passed += 1;
+            }
+        }
         var i: usize = 0;
         while (i < self.obstacles.items.len) {
             const o = self.obstacles.items[i];
@@ -810,6 +866,7 @@ const Game = struct {
         for (self.obstacles.items) |o| {
             if (self.collides(o)) {
                 self.state = .game_over;
+                self.pending_save = true;
                 break;
             }
         }
@@ -888,6 +945,13 @@ fn nowNs() i128 {
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
     return @as(i128, ts.sec) * 1000000000 + @as(i128, ts.nsec);
+}
+
+/// Wall clock seconds, for stamping a run in the history file.
+fn unixNow() i64 {
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
 }
 
 fn getWinsize() struct { rows: i32, cols: i32 } {
@@ -1360,11 +1424,41 @@ fn dumpKeys() !void {
     writeAll(STDOUT_FD, "\r\n");
 }
 
-pub fn main() !void {
+const USAGE =
+    \\dino - the chrome offline runner, in your terminal
+    \\
+    \\  dino          play
+    \\  dino view     stats from every run you have played
+    \\  dino keys     dump what your terminal sends for each key
+    \\  dino help     this
+    \\
+    \\history lives in $DINO_HISTORY, else $XDG_DATA_HOME/dino/history.tsv
+    \\
+;
+
+fn viewHistory(alloc: std.mem.Allocator) !void {
+    const runs = history.load(alloc) catch &.{};
+    defer if (runs.len != 0) alloc.free(runs);
+    const text = try history.report(alloc, runs);
+    defer alloc.free(text);
+    writeAll(STDOUT_FD, text);
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
+    {
+        var args = std.process.Args.Iterator.init(init.args);
+        _ = args.next(); // argv[0]
+        if (args.next()) |cmd| {
+            if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "stats")) return viewHistory(alloc);
+            if (std.mem.eql(u8, cmd, "keys")) return dumpKeys();
+            writeAll(STDOUT_FD, USAGE);
+            return;
+        }
+    }
     if (c.getenv("DINO_KEYS") != null) return dumpKeys();
 
     const is_tty = c.isatty(STDIN_FD) != 0;
@@ -1425,6 +1519,7 @@ pub fn main() !void {
         var jump = inp.jump;
 
         if (inp.quit) {
+            if (game.takeRun(false)) |run| history.append(run);
             running = false;
             break;
         }
@@ -1471,6 +1566,10 @@ pub fn main() !void {
         if (game.pending_beep) {
             game.pending_beep = false;
             writeAll(STDOUT_FD, "\x07");
+        }
+        if (game.pending_save) {
+            game.pending_save = false;
+            if (game.takeRun(true)) |run| history.append(run);
         }
     }
 }
