@@ -8,10 +8,17 @@ Authentic recreation of the Chrome offline dino runner (`chrome://dino`) for you
 
 ## Features — chrome parity
 
-- **Same sprites** — T-Rex running (2-frame), jumping, ducking (2-frame), dead (`×` eye), cactus variants (small/large × single/double/triple), pterodactyl (2-frame wing flap) — all built from block characters (`█ ▄ ▀`) to match the chrome 1-bit art
-- **Same physics** — gravity `0.12`, jump `-1.35`, duck-drop acceleration, tight AABB hitboxes (1px inset like chrome)
-- **Same gameplay** — scrolling ground with procedural bumps, parallax clouds, increasing speed (`1.5 → 5.2`), distance-based score, `HI` vs current score (`00000` format), night mode invert every `700` points, progressive difficulty spawns pteros after `500`
-- **Same vibe** — score at top-right, centered `G A M E  O V E R`, blink prompts, `Alt-screen` (`?1049h`) so scrollback is preserved
+- **Same sprites** — real pixel art, not ascii approximations. The T-Rex is a 20×20 downscale of chrome's 44×47 sprite (running 2-frame, jumping, ducking 2-frame, idle blink, dead), plus cactus variants (small/large × single/double/triple), 2-frame pterodactyl and outlined clouds
+- **Half-block renderer** — the whole scene is composed on a pixel canvas where two pixels share one cell (`█ ▀ ▄`), so a pixel is square and the silhouettes match the chrome 1-bit art. Terminals too small for the full sprites get an automatic 2× downscale
+- **Real day/night** — the canvas is painted, so the flip at every 700 points actually inverts: near-black with light sprites at night, light background with dark grey sprites by day. Starts at night and flips from there
+- **Chrome's scoring** — `round(distance * 0.025)` in chrome pixels, normalised so terminals of different widths score at the same rate; the meter blinks three times with a blip on every hundred
+- **Multi-box collision** — four boxes on the t-rex (head, neck, torso, legs) and three per cactus instead of one rectangle, so the snout and the tail stop killing you through empty space
+- **Intro** — the ground slides in and the dino runs on from the left before the first obstacle
+- **Same physics** — jump peaks at `1.2×` the dino height with a `~0.7s` airtime, duck fast-drop, tight AABB hitboxes (inset like chrome)
+- **Same gameplay** — scrolling ground with procedural pebbles, parallax clouds, chrome's speed ramp (`6 → 13` px/frame, scaled to the dino width and to the terminal width), distance-based score, `HI` vs current score (`00000` format), night mode invert every `700` points, progressive difficulty spawns pteros after `450` at three heights (jump / jump / duck)
+- **Ducking that holds** — terminals report no key-up, so the hold is inferred from auto-repeat with an adaptive window: the first press bridges the ~600ms repeat delay, then the window shrinks once repeats arrive. No duck/stand/duck stutter, and no way to get stuck ducking
+- **Per-run history** — every run is appended to a plain-text file and `dino view` turns it into best score, longest run, most obstacles, averages and a bar chart of recent runs
+- **Same vibe** — score at top-right, centered `G A M E  O V E R` with chrome's circular restart button, no colours chrome never uses, `Alt-screen` (`?1049h`) so scrollback is preserved
 
 ## Install
 
@@ -37,6 +44,36 @@ dino
 ```
 
 Prebuilt binaries for `0.0.1` in [`dist/releases/`](dist/releases/): `dino-macos-universal` (universal), `dino-x86_64-linux-musl` (static), `dino-aarch64-linux-musl`, `*-linux-gnu`, etc.
+
+## Commands
+
+```bash
+dino          # play
+dino view     # stats from every run you have played
+dino keys     # dump what your terminal sends for each key (input debugging)
+dino help
+```
+
+Every finished run is appended as one tab-separated line to
+`$XDG_DATA_HOME/dino/history.tsv` (falling back to `~/.local/share/dino/history.tsv`,
+overridable with `$DINO_HISTORY`): start time, duration, score, obstacles cleared,
+jumps, ducks, top speed and whether it ended in a death or a quit. Nothing leaves
+your machine, and the file is plain text — `grep`, `awk` and `sort` all work on it.
+
+`dino view` reports best score, longest run, most obstacles, averages, top speed,
+deaths vs quits, and a bar chart of your last runs:
+
+```
+dino  -  37 runs, 12m 44s played
+
+  best score       00412    16 Sep 21:04
+  longest run      2m07s    16 Sep 21:04
+  most obstacles   23       15 Sep 19:22
+  ...
+```
+
+Top speed is normalised to chrome's px/frame, so runs recorded in terminals of
+different widths stay comparable.
 
 ## Controls
 

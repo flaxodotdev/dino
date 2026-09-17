@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
+const history = @import("history.zig");
 
 // ---------------------------------------------------------------------------
 // Config
@@ -9,168 +10,457 @@ const FPS: u64 = 60;
 const FRAME_NS: u64 = 1_000_000_000 / FPS;
 const DINO_X: i32 = 6; // fixed column where dino lives
 
-const GRAVITY: f32 = 0.12;
-const JUMP_VEL: f32 = -1.35;
-const DROP_VEL: f32 = 5.0;
-const INITIAL_SPEED: f32 = 1.5;
-const MAX_SPEED: f32 = 5.2;
-const SPEED_INC: f32 = 0.00065;
-const GROUND_OFFSET_Y: i32 = 2; // ground is height-2
+// Physics are authored for the full scale dino (20 pixels tall) and are
+// multiplied by Game.scale() when the half scale sprites are in use.
+// peak = v^2 / (2g) = 2.30^2 / 0.22 ~= 24 px  (1.2x the dino, like chrome)
+// airtime = 2v/g ~= 42 frames ~= 0.7s
+const BASE_GRAVITY: f32 = 0.11;
+const BASE_JUMP_VEL: f32 = -2.30;
+const BASE_DROP_ACC: f32 = 0.45; // extra gravity while fast-dropping
 
-// Dino physics
-const DINO_GROUND_OFFSET: i32 = 4; // height of standing dino
-const DINO_DUCK_HEIGHT: i32 = 2;
-const DINO_WIDTH: i32 = 7;
-const DINO_HEIGHT: i32 = 4;
+// chrome runs at 6 px/frame with a 44 px wide dino and tops out at 13.
+const SPEED_PER_DINO_W: f32 = 6.0 / 44.0;
+const MAX_SPEED_RATIO: f32 = 13.0 / 6.0;
+const ACCEL_RATIO: f32 = 0.001 / 6.0;
+// chrome's canvas is 600 px wide == 13.6 dino widths
+const CANVAS_DINO_WIDTHS: f32 = 13.6;
+
+const GROUND_ROW_FROM_BOTTOM: i32 = 3; // ground line sits at height - 3
+
+// chrome's distance meter counts round(distance * 0.025) in its own pixels, so
+// 100 points is ~11s of running and 700 (the night flip) is well over a minute
+const SCORE_PER_CHROME_PX: f32 = 0.025;
+const CHROME_DINO_W: f32 = 44.0;
+
+const INTRO_FRAMES: i32 = 45; // ground slides in, dino runs on from the left
+const FLASH_PHASE_FRAMES: u64 = 15; // 250ms, same as chrome
+const FLASH_PHASES: u64 = 6; // three on/off blinks
 
 // ---------------------------------------------------------------------------
-// Sprites (chrome-authentic ascii approximation)
-// Using block characters – looks great in modern terminals
+// Sprites
+//
+// Every sprite is pixel art: one character per pixel, '#' = filled.
+// Vertically two pixels share one terminal cell (rendered with the half blocks
+// U+2588 U+2580 U+2584), so a pixel is roughly square in a normal terminal font.
+//
+// The dino is a 20x20 downscale of chrome's 44x47 t-rex. Holes (eye, mouth)
+// are aligned to even coordinates so they survive the automatic 2x downscale
+// used on small terminals.
 // ---------------------------------------------------------------------------
 
-// running frame A (legs spread)
+const DINO_IDLE = [_][]const u8{
+    "...........########.",
+    "..........##########",
+    "..........##..######",
+    "..........##..######",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#########..",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....####.####......",
+};
+
+// idle blink - chrome's dino winks while it waits
+const DINO_BLINK = [_][]const u8{
+    "...........########.",
+    "..........##########",
+    "..........##########",
+    "..........##########",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#########..",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....####.####......",
+};
+
+// run frame A - rear leg planted, front leg lifted
 const DINO_RUN_A = [_][]const u8{
-    " ██████ ",
-    " ██████▄",
-    " ██████ ",
-    "  ▀  ▀  ",
+    "...........########.",
+    "..........##########",
+    "..........##..######",
+    "..........##..######",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#########..",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..####......",
+    ".....###............",
+    ".....####...........",
 };
 
-// running frame B (legs together other phase)
+// run frame B - front leg planted, rear leg lifted
 const DINO_RUN_B = [_][]const u8{
-    " ██████ ",
-    " ██████▄",
-    " ██████ ",
-    "  ▀▄ ▀▄ ",
+    "...........########.",
+    "..........##########",
+    "..........##..######",
+    "..........##..######",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#########..",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    "....####..###.......",
+    "..........###.......",
+    "..........####......",
 };
 
+// jump - legs together, tucked
 const DINO_JUMP = [_][]const u8{
-    " ██████ ",
-    " ██████▄",
-    " ██████ ",
-    "  ▀  ▀  ",
+    "...........########.",
+    "..........##########",
+    "..........##..######",
+    "..........##..######",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#########..",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....####.####......",
 };
 
+// dead - eye shut, jaw dropped
+const DINO_DEAD = [_][]const u8{
+    "...........########.",
+    "..........##########",
+    "..........##....####",
+    "..........##....####",
+    "..........##########",
+    "..........##########",
+    "..........####......",
+    ".........#####......",
+    "........######......",
+    "......########......",
+    "..############......",
+    "###############.....",
+    "################....",
+    "....###########.....",
+    ".....########.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....###..###.......",
+    ".....####.####......",
+};
+
+// ducking dino - chrome's 59x30 sprite, stretched low and long
 const DINO_DUCK_A = [_][]const u8{
-    "   ██████▄ ",
-    " █████████ ",
-    "   ▀  ▀ ▀▄ ",
+    "..................#######.",
+    ".................#########",
+    ".................##..#####",
+    ".................##..#####",
+    ".................####.....",
+    "................#########.",
+    "..###################.....",
+    "####################......",
+    ".#################........",
+    ".....###...###............",
+    ".....###...###............",
+    ".....####..####...........",
 };
 
 const DINO_DUCK_B = [_][]const u8{
-    "   ██████▄ ",
-    " █████████ ",
-    "   ▀▄ ▀  ▀ ",
+    "..................#######.",
+    ".................#########",
+    ".................##..#####",
+    ".................##..#####",
+    ".................####.....",
+    "................#########.",
+    "..###################.....",
+    "####################......",
+    ".#################........",
+    ".....###...###............",
+    ".....###...###............",
+    "....####..####............",
 };
 
-const DINO_DEAD = [_][]const u8{
-    " ██████ ",
-    " ████×█▄",
-    " ██████ ",
-    "  ▀  ▀  ",
+// cactus - chrome's two sizes, trunk plus one arm on each side
+const CACTUS_SMALL = [_][]const u8{
+    "....##...",
+    "....##...",
+    "....##...",
+    "....##...",
+    ".##.##...",
+    ".##.##...",
+    ".##.##.##",
+    ".#####.##",
+    "....##.##",
+    "....#####",
+    "....##...",
+    "....##...",
+    "....##...",
+    "....##...",
 };
 
-// cactus sprites – small and large variants (like chrome)
-const CACTUS_SMALL_SINGLE = [_][]const u8{
-    " █ ",
-    " █ ",
-    "███",
+const CACTUS_LARGE = [_][]const u8{
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".###.###.....",
+    ".###.###.....",
+    ".###.###.###.",
+    ".###.###.###.",
+    ".#######.###.",
+    ".#######.###.",
+    ".....#######.",
+    ".....#######.",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
+    ".....###.....",
 };
 
-const CACTUS_SMALL_DOUBLE = [_][]const u8{
-    " █  █ ",
-    " █  █ ",
-    "██████",
-};
-
-const CACTUS_SMALL_TRIPLE = [_][]const u8{
-    " █  █  █ ",
-    " █  █  █ ",
-    "█████████",
-};
-
-const CACTUS_LARGE_SINGLE = [_][]const u8{
-    "  █  ",
-    "  █  ",
-    "  █  ",
-    "█████",
-};
-
-const CACTUS_LARGE_DOUBLE = [_][]const u8{
-    "  █    █  ",
-    "  █    █  ",
-    "  █    █  ",
-    "██████████",
-};
-
-const CACTUS_LARGE_TRIPLE = [_][]const u8{
-    "  █    █    █  ",
-    "  █    █    █  ",
-    "  █    █    █  ",
-    "███████████████",
-};
-
-// pterodactyl (chrome bird) – 2 frames of wing flap
+// pterodactyl - flies left, wings up / wings down
 const PTERO_A = [_][]const u8{
-    "  ▄▄▄  ",
-    " █▄█▄█ ",
+    "......#####.....",
+    ".....######.....",
+    "....######......",
+    "...######.......",
+    "..######........",
+    "#########.####..",
+    "##############..",
+    "....#######.....",
+    ".....#####......",
+    "......###.......",
 };
 
 const PTERO_B = [_][]const u8{
-    "  ▀█▀  ",
-    " █▄█▄█ ",
+    "......###.......",
+    ".....#####......",
+    "....#######.....",
+    "#########.####..",
+    "##############..",
+    "..#######.......",
+    "...######.......",
+    "....######......",
+    ".....######.....",
+    "......#####.....",
 };
 
-// clouds
-const CLOUD = "☁☁☁";
+// restart button - chrome's circular arrow, shown on the game over screen
+const RESTART = [_][]const u8{
+    "....####....",
+    "..##....##..",
+    ".##......###",
+    "##........##",
+    "##........##",
+    "##........##",
+    "##........##",
+    "##........##",
+    ".##......##.",
+    "..##....##..",
+    "....####....",
+};
 
-// ground pattern
-const GROUND_CHAR = "─";
-const GROUND_BUMP = "▁";
+// cloud - chrome draws it as an outline
+const CLOUD = [_][]const u8{
+    "....######....",
+    "..##......##..",
+    ".##........##.",
+    "##..........##",
+    "#............#",
+    ".############.",
+};
+
+// ---------------------------------------------------------------------------
+// Sprite helpers - '#' lookup, with optional 2x downscale for small terminals
+// ---------------------------------------------------------------------------
+const Art = []const []const u8;
+
+fn artOn(art: Art, x: i32, y: i32) bool {
+    if (y < 0 or x < 0) return false;
+    const uy: usize = @intCast(y);
+    if (uy >= art.len) return false;
+    const row = art[uy];
+    const ux: usize = @intCast(x);
+    if (ux >= row.len) return false;
+    return row[ux] == '#';
+}
+
+/// Sample one output pixel. At half scale a 2x2 source block lights up when at
+/// least two of its four pixels are filled.
+fn artPixel(art: Art, x: i32, y: i32, half: bool) bool {
+    if (!half) return artOn(art, x, y);
+    var n: u32 = 0;
+    if (artOn(art, x * 2, y * 2)) n += 1;
+    if (artOn(art, x * 2 + 1, y * 2)) n += 1;
+    if (artOn(art, x * 2, y * 2 + 1)) n += 1;
+    if (artOn(art, x * 2 + 1, y * 2 + 1)) n += 1;
+    return n >= 2;
+}
+
+fn artW(art: Art, half: bool) i32 {
+    const w: i32 = @intCast(art[0].len);
+    return if (half) @divTrunc(w + 1, 2) else w;
+}
+
+fn artH(art: Art, half: bool) i32 {
+    const h: i32 = @intCast(art.len);
+    return if (half) @divTrunc(h + 1, 2) else h;
+}
+
+// ---------------------------------------------------------------------------
+// Collision boxes
+//
+// One rectangle around a t-rex is mostly empty space - the snout is top right,
+// the tail is mid left - so corners kill you unfairly. Chrome splits each
+// sprite into a handful of boxes instead; these are the same idea, in sprite
+// pixel coordinates.
+// ---------------------------------------------------------------------------
+const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+const DINO_BOXES = [_]Rect{
+    .{ .x = 10, .y = 0, .w = 10, .h = 8 }, // head and snout
+    .{ .x = 7, .y = 7, .w = 8, .h = 4 }, // neck and chest
+    .{ .x = 3, .y = 10, .w = 13, .h = 5 }, // torso, arm, tail root
+    .{ .x = 5, .y = 14, .w = 9, .h = 6 }, // legs
+};
+
+const DINO_DUCK_BOXES = [_]Rect{
+    .{ .x = 16, .y = 0, .w = 10, .h = 6 },
+    .{ .x = 1, .y = 6, .w = 20, .h = 3 },
+    .{ .x = 5, .y = 9, .w = 10, .h = 3 },
+};
+
+const CACTUS_SMALL_BOXES = [_]Rect{
+    .{ .x = 4, .y = 0, .w = 2, .h = 14 },
+    .{ .x = 1, .y = 4, .w = 2, .h = 4 },
+    .{ .x = 7, .y = 6, .w = 2, .h = 4 },
+};
+
+const CACTUS_LARGE_BOXES = [_]Rect{
+    .{ .x = 5, .y = 0, .w = 3, .h = 20 },
+    .{ .x = 1, .y = 5, .w = 3, .h = 6 },
+    .{ .x = 9, .y = 7, .w = 3, .h = 6 },
+};
+
+const PTERO_BOXES = [_]Rect{
+    .{ .x = 0, .y = 3, .w = 6, .h = 3 }, // beak and head
+    .{ .x = 5, .y = 2, .w = 10, .h = 5 }, // body
+};
+
+/// Sprite-space box to screen-pixel box; at half scale it has to round outward
+/// so a box never shrinks to nothing.
+fn scaleRect(b: Rect, half: bool) Rect {
+    if (!half) return b;
+    const x = @divTrunc(b.x, 2);
+    const y = @divTrunc(b.y, 2);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(1, @divTrunc(b.x + b.w + 1, 2) - x),
+        .h = @max(1, @divTrunc(b.y + b.h + 1, 2) - y),
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-const ObstacleKind = enum {
-    cactus_small_single,
-    cactus_small_double,
-    cactus_small_triple,
-    cactus_large_single,
-    cactus_large_double,
-    cactus_large_triple,
-    ptero_low,
-    ptero_mid,
-    ptero_high,
-};
+const ObstacleKind = enum { cactus_small, cactus_large, ptero };
+
+const PteroHeight = enum { low, mid, high };
 
 const Obstacle = struct {
     x: f32,
-    y: i32, // y offset from top (will be computed from ground)
     kind: ObstacleKind,
-    w: i32,
-    h: i32,
+    count: u8 = 1,
+    level: PteroHeight = .low,
+    passed: bool = false, // already behind the dino, counted once
 };
 
 const Cloud = struct {
     x: f32,
-    y: i32,
+    y: i32, // pixel row
 };
 
 const GameState = enum { idle, playing, game_over };
 
+// pixel colour ids
+const C_DINO: u8 = 1;
+const C_CACTUS: u8 = 2;
+const C_CLOUD: u8 = 3;
+const C_GROUND: u8 = 4;
+
 const Game = struct {
     width: i32,
     height: i32,
+    half: bool = false,
     state: GameState = .idle,
-    dino_y: f32 = 0, // 0 = on ground, negative = in air (pixels up)
+    dino_y: f32 = 0, // pixels above ground (negative = airborne)
     dino_vy: f32 = 0,
     on_ground: bool = true,
     ducking: bool = false,
-    duck_timer: i32 = 0,
     frame: u64 = 0,
     score: u32 = 0,
+    score_f: f32 = 0,
     hi_score: u32 = 0,
-    speed: f32 = INITIAL_SPEED,
+    intro: i32 = 0,
+    flash_start: u64 = 0,
+    flashing: bool = false,
+    pending_beep: bool = false,
+    // per-run stats, written to the history file when the run ends
+    run_started: i64 = 0,
+    run_start_ns: i128 = 0,
+    run_active: bool = false,
+    pending_save: bool = false,
+    obstacles_passed: u32 = 0,
+    jumps: u32 = 0,
+    ducks: u32 = 0,
+    top_speed: f32 = 0,
+    speed: f32 = 1,
     ground_scroll: f32 = 0,
     allocator: std.mem.Allocator,
     obstacles: std.ArrayList(Obstacle),
@@ -179,7 +469,11 @@ const Game = struct {
     dist_since_spawn: f32 = 0,
     blink: bool = false,
     rng: std.Random.DefaultPrng,
-    inverted: bool = false, // day/nigh like chrome
+    inverted: bool = true, // start at night; the flip at 700 goes to day
+    // pixel canvas: width x (2 * height)
+    px: []u8 = &.{},
+    px_w: i32 = 0,
+    px_h: i32 = 0,
 
     fn init(alloc: std.mem.Allocator, w: i32, h: i32) Game {
         var ts: c.timespec = undefined;
@@ -199,295 +493,445 @@ const Game = struct {
     fn deinit(self: *Game) void {
         self.obstacles.deinit(self.allocator);
         self.clouds.deinit(self.allocator);
+        if (self.px.len != 0) self.allocator.free(self.px);
     }
 
+    // -- scale -------------------------------------------------------------
+    /// Terminals that cannot fit the 20px dino plus a full jump fall back to
+    /// the automatically downscaled 10px sprites.
+    fn pickScale(self: *Game) void {
+        self.half = self.height < 26 or self.width < 90;
+    }
+
+    fn scale(self: *Game) f32 {
+        return if (self.half) 0.5 else 1.0;
+    }
+
+    fn dinoW(self: *Game) i32 {
+        return artW(&DINO_IDLE, self.half);
+    }
+
+    fn dinoH(self: *Game) i32 {
+        return artH(&DINO_IDLE, self.half);
+    }
+
+    fn gravity(self: *Game) f32 {
+        return BASE_GRAVITY * self.scale();
+    }
+
+    fn jumpVel(self: *Game) f32 {
+        return BASE_JUMP_VEL * self.scale();
+    }
+
+    /// Narrow terminals show fewer dino-widths than chrome's canvas, so the
+    /// world scrolls proportionally slower and reaction time stays honest.
+    fn widthScale(self: *Game) f32 {
+        const target = CANVAS_DINO_WIDTHS * @as(f32, @floatFromInt(self.dinoW()));
+        const got = @as(f32, @floatFromInt(self.width)) / target;
+        return std.math.clamp(got, 0.5, 1.0);
+    }
+
+    fn baseSpeed(self: *Game) f32 {
+        return SPEED_PER_DINO_W * @as(f32, @floatFromInt(self.dinoW())) * self.widthScale();
+    }
+
+    fn maxSpeed(self: *Game) f32 {
+        return self.baseSpeed() * MAX_SPEED_RATIO;
+    }
+
+    // -- geometry ----------------------------------------------------------
+    /// Pixel row of the ground line. Sprites stand on groundPy() - 1.
+    fn groundPy(self: *Game) i32 {
+        return (self.height - GROUND_ROW_FROM_BOTTOM) * 2;
+    }
+
+    /// Column the dino stands in. During the intro it runs on from off-screen.
+    fn dinoX(self: *Game) i32 {
+        if (self.intro <= 0) return DINO_X;
+        const slide_frames: i32 = @divTrunc(INTRO_FRAMES * 2, 3);
+        const done = INTRO_FRAMES - self.intro;
+        if (done >= slide_frames) return DINO_X;
+        const start = -self.dinoW();
+        const t = @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(slide_frames));
+        const span: f32 = @floatFromInt(DINO_X - start);
+        return start + @as(i32, @intFromFloat(@round(span * t)));
+    }
+
+    /// How much of the ground has slid in during the intro, in columns.
+    fn introGroundW(self: *Game) i32 {
+        if (self.intro <= 0) return self.width;
+        const done = INTRO_FRAMES - self.intro;
+        const t = @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(INTRO_FRAMES));
+        return @intFromFloat(@round(@as(f32, @floatFromInt(self.width)) * t));
+    }
+
+    fn dinoArt(self: *Game) Art {
+        if (self.state == .game_over) return &DINO_DEAD;
+        if (!self.on_ground) return &DINO_JUMP;
+        if (self.ducking) {
+            return if ((self.frame / 6) % 2 == 0) @as(Art, &DINO_DUCK_A) else @as(Art, &DINO_DUCK_B);
+        }
+        if (self.state == .idle and self.intro <= 0) {
+            return if (self.blink and (self.frame / 20) % 8 == 0) @as(Art, &DINO_BLINK) else @as(Art, &DINO_IDLE);
+        }
+        return if ((self.frame / 6) % 2 == 0) @as(Art, &DINO_RUN_A) else @as(Art, &DINO_RUN_B);
+    }
+
+    /// Top pixel row of the dino for the given sprite.
+    fn dinoTopPy(self: *Game, art: Art) i32 {
+        const bottom = self.groundPy() - 1;
+        const h = artH(art, self.half);
+        const base = bottom - h + 1;
+        if (self.ducking and self.on_ground) return base;
+        return base + @as(i32, @intFromFloat(@floor(self.dino_y)));
+    }
+
+    fn dinoBoxes(self: *Game) []const Rect {
+        return if (self.ducking and self.on_ground) &DINO_DUCK_BOXES else &DINO_BOXES;
+    }
+
+    fn obstacleBoxes(_: *Game, o: Obstacle) []const Rect {
+        return switch (o.kind) {
+            .cactus_small => &CACTUS_SMALL_BOXES,
+            .cactus_large => &CACTUS_LARGE_BOXES,
+            .ptero => &PTERO_BOXES,
+        };
+    }
+
+    fn obstacleArt(self: *Game, o: Obstacle) Art {
+        return switch (o.kind) {
+            .cactus_small => &CACTUS_SMALL,
+            .cactus_large => &CACTUS_LARGE,
+            .ptero => if ((self.frame / 9) % 2 == 0) @as(Art, &PTERO_A) else @as(Art, &PTERO_B),
+        };
+    }
+
+    fn cactusGap(self: *Game) i32 {
+        return if (self.half) 1 else 2;
+    }
+
+    fn obstacleW(self: *Game, o: Obstacle) i32 {
+        const w = artW(self.obstacleArt(o), self.half);
+        const n: i32 = @intCast(o.count);
+        return w * n + self.cactusGap() * (n - 1);
+    }
+
+    /// Top pixel row of an obstacle.
+    fn obstacleTopPy(self: *Game, o: Obstacle) i32 {
+        const art = self.obstacleArt(o);
+        const h = artH(art, self.half);
+        const bottom = self.groundPy() - 1;
+        if (o.kind != .ptero) return bottom - h + 1;
+        const lift: i32 = switch (o.level) {
+            .low => 0,
+            .mid => @intFromFloat(6 * self.scale()),
+            .high => @intFromFloat(12 * self.scale()),
+        };
+        return bottom - lift - h + 1;
+    }
+
+    /// Cheap whole-sprite test first, then chrome's per-box pass.
+    fn collides(self: *Game, o: Obstacle) bool {
+        const dart = self.dinoArt();
+        const dx = self.dinoX();
+        const dy = self.dinoTopPy(dart);
+        const oart = self.obstacleArt(o);
+        const ox: i32 = @intFromFloat(@round(o.x));
+        const oy = self.obstacleTopPy(o);
+
+        const dino_rect: Rect = .{ .x = dx, .y = dy, .w = artW(dart, self.half), .h = artH(dart, self.half) };
+        const obs_rect: Rect = .{ .x = ox, .y = oy, .w = self.obstacleW(o), .h = artH(oart, self.half) };
+        if (!rectsOverlap(dino_rect, obs_rect)) return false;
+
+        const step = artW(oart, self.half) + self.cactusGap();
+        for (self.dinoBoxes()) |raw_a| {
+            const ba = scaleRect(raw_a, self.half);
+            const a: Rect = .{ .x = dx + ba.x, .y = dy + ba.y, .w = ba.w, .h = ba.h };
+            var n: i32 = 0;
+            while (n < @as(i32, @intCast(o.count))) : (n += 1) {
+                for (self.obstacleBoxes(o)) |raw_b| {
+                    const bb = scaleRect(raw_b, self.half);
+                    const b: Rect = .{ .x = ox + n * step + bb.x, .y = oy + bb.y, .w = bb.w, .h = bb.h };
+                    if (rectsOverlap(a, b)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // -- lifecycle ---------------------------------------------------------
     fn reset(self: *Game) void {
+        self.pickScale();
         self.dino_y = 0;
         self.dino_vy = 0;
         self.on_ground = true;
         self.ducking = false;
-        self.duck_timer = 0;
         self.frame = 0;
         self.score = 0;
-        self.speed = INITIAL_SPEED;
+        self.score_f = 0;
+        self.intro = 0;
+        self.flashing = false;
+        self.pending_beep = false;
+        self.run_active = false;
+        self.pending_save = false;
+        self.obstacles_passed = 0;
+        self.jumps = 0;
+        self.ducks = 0;
+        self.top_speed = 0;
+        self.speed = self.baseSpeed();
         self.ground_scroll = 0;
         self.obstacles.clearRetainingCapacity();
         self.clouds.clearRetainingCapacity();
         self.dist_since_spawn = 0;
-        self.next_spawn_dist = 55;
-        self.inverted = false;
-        // seed some clouds
-        self.clouds.clearRetainingCapacity();
+        self.next_spawn_dist = self.speed * 90;
+        self.inverted = true;
         var i: usize = 0;
         while (i < 3) : (i += 1) {
-            const cx: f32 = @floatFromInt(self.rng.random().intRangeAtMost(i32, 10, self.width - 10));
-            const cy: i32 = self.rng.random().intRangeAtMost(i32, 2, 6);
-            self.clouds.append(self.allocator, .{ .x = cx, .y = cy }) catch {};
+            self.spawnCloud(self.rng.random().intRangeAtMost(i32, 10, @max(11, self.width - 10)));
         }
         self.state = .idle;
     }
 
-    fn groundY(self: *Game) i32 {
-        return self.height - GROUND_OFFSET_Y;
+    /// Chrome's speed in px/frame, so history from different terminal widths
+    /// can be compared.
+    fn chromeSpeed(self: *Game) f32 {
+        const px_per_col = CHROME_DINO_W / @as(f32, @floatFromInt(self.dinoW()));
+        return self.speed * px_per_col / self.widthScale();
     }
 
-    fn dinoTopY(self: *Game) i32 {
-        // dino_y is negative when jumping, 0 on ground. Convert to screen y.
-        const gy = self.groundY();
-        if (self.ducking and self.on_ground) {
-            // ducking height is 2 + 1 padding
-            const h = DINO_DUCK_HEIGHT + 1;
-            const y = gy - h + 1;
-            return y;
-        } else {
-            const h = DINO_HEIGHT;
-            const base = gy - h + 1;
-            return base + @as(i32, @intFromFloat(@floor(self.dino_y)));
-        }
+    fn startRun(self: *Game) void {
+        self.state = .playing;
+        self.frame = 0;
+        self.speed = self.baseSpeed();
+        self.intro = INTRO_FRAMES;
+        self.run_started = unixNow();
+        self.run_start_ns = nowNs();
+        self.run_active = true;
     }
 
-    fn dinoHitbox(self: *Game) struct { x: i32, y: i32, w: i32, h: i32 } {
-        const ty = self.dinoTopY();
-        if (self.ducking and self.on_ground) {
-            // duck is wider, lower, tighter box
-            return .{ .x = DINO_X + 1, .y = ty + 1, .w = 8, .h = 2 };
-        } else {
-            // standing/jumping – trim 1 pixel from left/right for fairness like chrome
-            return .{ .x = DINO_X + 1, .y = ty + 1, .w = 5, .h = 3 };
-        }
+    /// Hand the finished run to the caller to persist. Safe to call twice.
+    fn takeRun(self: *Game, death: bool) ?history.Run {
+        if (!self.run_active) return null;
+        self.run_active = false;
+        const ms: i64 = @intCast(@divTrunc(nowNs() - self.run_start_ns, 1_000_000));
+        return .{
+            .started = self.run_started,
+            .ms = ms,
+            .score = self.score,
+            .obstacles = self.obstacles_passed,
+            .jumps = self.jumps,
+            .ducks = self.ducks,
+            .speed_x100 = @intFromFloat(@round(self.top_speed * 100)),
+            .death = death,
+        };
     }
 
-    fn obstacleHitbox(o: Obstacle, gy: i32) struct { x: i32, y: i32, w: i32, h: i32 } {
-        const ox: i32 = @intFromFloat(@round(o.x));
-        // y is precomputed as ground-relative
-        // For cactus: sits on ground, top = gy - h +1
-        // For ptero: y is absolute
-        var oy: i32 = undefined;
-        switch (o.kind) {
-            .ptero_low, .ptero_mid, .ptero_high => oy = o.y,
-            else => oy = gy - o.h + 1,
-        }
-        // shrink hitbox slightly like chrome (1px inset)
-        return .{ .x = ox + 1, .y = oy + 1, .w = @max(1, o.w - 2), .h = @max(1, o.h - 1) };
+    fn spawnCloud(self: *Game, at_x: i32) void {
+        const top = 4;
+        const bottom = @max(top + 1, self.groundPy() - self.dinoH() * 2);
+        const y = self.rng.random().intRangeAtMost(i32, top, bottom);
+        self.clouds.append(self.allocator, .{ .x = @floatFromInt(at_x), .y = y }) catch {};
     }
 
     fn spawnObstacle(self: *Game) void {
         const r = self.rng.random();
-        // after 500 points, start spawning pteros 30% chance
-        const use_ptero = self.score > 500 and r.intRangeAtMost(u32, 0, 9) < 3;
-        var kind: ObstacleKind = undefined;
-        var w: i32 = 3;
-        var h: i32 = 3;
-        var y: i32 = 0;
-        const gy = self.groundY();
+        const use_ptero = self.score > 450 and r.intRangeAtMost(u32, 0, 9) < 3;
+        var o: Obstacle = .{ .x = @floatFromInt(self.width + 2), .kind = .cactus_small };
         if (use_ptero) {
-            const sel = r.intRangeAtMost(u32, 0, 2);
-            switch (sel) {
-                0 => {
-                    kind = .ptero_low;
-                    w = 7;
-                    h = 2;
-                    y = gy - 2; // just above ground
-                },
-                1 => {
-                    kind = .ptero_mid;
-                    w = 7;
-                    h = 2;
-                    y = gy - 5;
-                },
-                else => {
-                    kind = .ptero_high;
-                    w = 7;
-                    h = 2;
-                    y = gy - 7;
-                },
-            }
-            // duck-required ptero height: if speed high, more mid/high
+            o.kind = .ptero;
+            o.level = switch (r.intRangeAtMost(u32, 0, 2)) {
+                0 => .low,
+                1 => .mid,
+                else => .high,
+            };
         } else {
-            // cactus variants weighted like chrome
             const roll = r.intRangeAtMost(u32, 0, 99);
-            if (roll < 20) {
-                kind = .cactus_small_single;
-                w = 3;
-                h = 3;
-            } else if (roll < 35) {
-                kind = .cactus_small_double;
-                w = 6;
-                h = 3;
-            } else if (roll < 45) {
-                kind = .cactus_small_triple;
-                w = 9;
-                h = 3;
-            } else if (roll < 65) {
-                kind = .cactus_large_single;
-                w = 5;
-                h = 4;
-            } else if (roll < 85) {
-                kind = .cactus_large_double;
-                w = 10;
-                h = 4;
+            if (roll < 45) {
+                o.kind = .cactus_small;
+                o.count = if (roll < 20) 1 else if (roll < 35) 2 else 3;
             } else {
-                kind = .cactus_large_triple;
-                w = 15;
-                h = 4;
+                o.kind = .cactus_large;
+                o.count = if (roll < 65) 1 else if (roll < 85) 2 else 3;
             }
-            y = gy - h + 1;
         }
-        self.obstacles.append(self.allocator, .{ .x = @floatFromInt(self.width + 2), .y = y, .kind = kind, .w = w, .h = h }) catch {};
-        // next distance scales fairly with speed – keeps reaction time ~constant
-        // base 42-60 + speed*4.5  => at 1.5: 49 +6.7=~56 cols (~37 frames, 0.61s), at 5.2: 49+23=72 cols (~14 frames, 0.23s)
-        const base: f32 = @floatFromInt(r.intRangeAtMost(i32, 42, 60));
-        self.next_spawn_dist = base + self.speed * 4.5;
+        self.obstacles.append(self.allocator, o) catch {};
+
+        // Gap expressed in frames so reaction time stays constant as we speed
+        // up, shrinking a little towards max speed like chrome does.
+        const span = @max(0.001, self.maxSpeed() - self.baseSpeed());
+        const t = std.math.clamp((self.speed - self.baseSpeed()) / span, 0, 1);
+        const raw: f32 = @floatFromInt(r.intRangeAtMost(i32, 55, 110));
+        const gap_frames = @max(44.0, raw * (1.0 - 0.32 * t));
+        self.next_spawn_dist = self.speed * gap_frames;
         self.dist_since_spawn = 0;
     }
 
-    fn update(self: *Game, want_jump: bool, want_duck: bool, want_duck_hold: bool) void {
+    fn update(self: *Game, want_jump: bool, duck_down: bool) void {
         self.frame += 1;
-        // blink for idle
         if (self.frame % 20 == 0) self.blink = !self.blink;
 
-        // handle duck timer for hold behavior (terminal has no keyup)
-        if (want_duck) self.duck_timer = 8;
-        if (self.duck_timer > 0) {
-            self.duck_timer -= 1;
-            self.ducking = want_duck_hold or self.duck_timer > 4;
-            // also consider immediate press
-            if (want_duck) self.ducking = true;
-        } else {
-            self.ducking = false;
-        }
-        // if jumping and ducking, cancel duck
-        if (!self.on_ground) self.ducking = false;
+        const was_ducking = self.ducking;
+        self.ducking = duck_down and self.on_ground;
+        if (self.ducking and !was_ducking and self.state == .playing) self.ducks += 1;
 
         if (self.state == .idle) {
-            // ground still scrolls idle like chrome shows static? We'll scroll a little
-            self.ground_scroll += self.speed * 0.5;
-            if (self.ground_scroll >= 20) self.ground_scroll -= 20;
-            // update clouds idle
-            for (self.clouds.items) |*cl| {
-                cl.x -= 0.3;
-                if (cl.x < -5) {
-                    cl.x = @floatFromInt(self.width + 2);
-                    cl.y = self.rng.random().intRangeAtMost(i32, 2, 6);
-                }
-            }
-            if (want_jump) {
-                self.state = .playing;
-                self.frame = 0;
-                // beep start
-            }
+            self.ground_scroll += self.baseSpeed() * 0.5;
+            self.moveClouds(self.baseSpeed() * 0.15);
+            if (want_jump) self.startRun();
             return;
         }
 
-        if (self.state == .game_over) {
+        if (self.state == .game_over) return;
+
+        // intro: the ground slides in and the dino runs on, nothing else yet
+        if (self.intro > 0) {
+            self.intro -= 1;
+            self.ground_scroll += self.speed;
+            self.moveClouds(self.speed * 0.15);
             return;
         }
 
-        // playing update
-        // jump input
         if (want_jump and self.on_ground and !self.ducking) {
-            self.dino_vy = JUMP_VEL;
+            self.dino_vy = self.jumpVel();
             self.on_ground = false;
+            self.jumps += 1;
         }
-        // duck while in air = fast drop (chrome drop)
-        if (!self.on_ground and want_duck) {
-            self.dino_vy += DROP_VEL * 0.12;
+        if (!self.on_ground and duck_down) {
+            self.dino_vy += BASE_DROP_ACC * self.scale();
         }
 
-        // physics
         if (!self.on_ground) {
             self.dino_y += self.dino_vy;
-            self.dino_vy += GRAVITY;
+            self.dino_vy += self.gravity();
             if (self.dino_y >= 0) {
                 self.dino_y = 0;
                 self.dino_vy = 0;
                 self.on_ground = true;
             }
-        } else {
-            // keep duck state while hold
         }
 
-        // speed ramp
-        if (self.speed < MAX_SPEED) {
-            self.speed += SPEED_INC;
+        if (self.speed < self.maxSpeed()) {
+            self.speed += self.baseSpeed() * ACCEL_RATIO;
         }
+        const cs = self.chromeSpeed();
+        if (cs > self.top_speed) self.top_speed = cs;
 
-        // score
-        self.score += 1;
+        // chrome counts round(distance * 0.025) in its own 44px-dino pixels;
+        // normalising by widthScale keeps scores comparable across terminals
+        const px_per_col = CHROME_DINO_W / @as(f32, @floatFromInt(self.dinoW()));
+        const prev = self.score;
+        self.score_f += self.speed * px_per_col / self.widthScale() * SCORE_PER_CHROME_PX;
+        self.score = @intFromFloat(self.score_f);
         if (self.score > self.hi_score) self.hi_score = self.score;
-        // like chrome, every 100 points flash and invert every 700
-        if (self.score % 700 == 0 and self.score != 0) {
-            self.inverted = !self.inverted;
+
+        if (self.score / 100 != prev / 100 and self.score != 0) {
+            self.flashing = true;
+            self.flash_start = self.frame;
+            self.pending_beep = true;
+        }
+        if (self.score / 700 != prev / 700 and self.score != 0) self.inverted = !self.inverted;
+        if (self.flashing and self.frame - self.flash_start >= FLASH_PHASE_FRAMES * FLASH_PHASES) {
+            self.flashing = false;
         }
 
-        // ground scroll
         self.ground_scroll += self.speed;
-        if (self.ground_scroll >= 40) self.ground_scroll -= 40;
-
-        // clouds
-        for (self.clouds.items) |*cl| {
-            cl.x -= self.speed * 0.15;
-            if (cl.x < -6) {
-                cl.x = @floatFromInt(self.width + 5);
-                cl.y = self.rng.random().intRangeAtMost(i32, 2, 6);
-            }
-        }
-        // occasionally add cloud
+        self.moveClouds(self.speed * 0.15);
         if (self.frame % 200 == 0 and self.clouds.items.len < 5) {
-            self.clouds.append(self.allocator, .{ .x = @floatFromInt(self.width + 2), .y = self.rng.random().intRangeAtMost(i32, 2, 6) }) catch {};
+            self.spawnCloud(self.width + 2);
         }
 
-        // obstacles movement
+        const dino_left: f32 = @floatFromInt(self.dinoX());
         for (self.obstacles.items) |*o| {
             o.x -= self.speed;
-            // ptero animated wing via frame? keep y bubble for low pteros? Add slight bob?
-            if (o.kind == .ptero_low or o.kind == .ptero_mid or o.kind == .ptero_high) {
-                // subtle up/down float
-                // do nothing – wing flap is visual only
+            if (!o.passed and o.x + @as(f32, @floatFromInt(self.obstacleW(o.*))) < dino_left) {
+                o.passed = true;
+                self.obstacles_passed += 1;
             }
         }
-        // remove offscreen
         var i: usize = 0;
         while (i < self.obstacles.items.len) {
-            if (self.obstacles.items[i].x + @as(f32, @floatFromInt(self.obstacles.items[i].w)) < -2) {
+            const o = self.obstacles.items[i];
+            if (o.x + @as(f32, @floatFromInt(self.obstacleW(o))) < -2) {
                 _ = self.obstacles.orderedRemove(i);
             } else {
                 i += 1;
             }
         }
 
-        // spawn logic
         self.dist_since_spawn += self.speed;
         if (self.obstacles.items.len == 0 or self.dist_since_spawn >= self.next_spawn_dist) {
-            // also ensure not too crowded: last obstacle far enough
-            if (self.obstacles.items.len == 0) {
-                self.spawnObstacle();
-            } else {
-                const last = self.obstacles.items[self.obstacles.items.len - 1];
-                if (last.x < @as(f32, @floatFromInt(self.width)) - self.next_spawn_dist) {
-                    self.spawnObstacle();
-                } else if (self.dist_since_spawn > self.next_spawn_dist + 40) {
-                    // force spawn if waited too long
-                    self.spawnObstacle();
-                }
-            }
+            self.spawnObstacle();
         }
 
-        // collision
-        const dbox = self.dinoHitbox();
-        const gy = self.groundY();
         for (self.obstacles.items) |o| {
-            const obox = obstacleHitbox(o, gy);
-            if (boxesOverlap(dbox, obox)) {
+            if (self.collides(o)) {
                 self.state = .game_over;
-                // store hi
+                self.pending_save = true;
                 break;
+            }
+        }
+    }
+
+    /// Chrome blinks the meter three times when you pass a hundred.
+    fn scoreVisible(self: *Game) bool {
+        if (!self.flashing) return true;
+        return ((self.frame - self.flash_start) / FLASH_PHASE_FRAMES) % 2 == 0;
+    }
+
+    fn moveClouds(self: *Game, dx: f32) void {
+        for (self.clouds.items) |*cl| {
+            cl.x -= dx;
+            if (cl.x < -@as(f32, @floatFromInt(artW(&CLOUD, self.half)))) {
+                cl.x = @floatFromInt(self.width + 2);
+                const top = 4;
+                const bottom = @max(top + 1, self.groundPy() - self.dinoH() * 2);
+                cl.y = self.rng.random().intRangeAtMost(i32, top, bottom);
+            }
+        }
+    }
+
+    // -- pixel canvas ------------------------------------------------------
+    fn ensureCanvas(self: *Game) !void {
+        const w = self.width;
+        const h = self.height * 2;
+        if (self.px_w == w and self.px_h == h and self.px.len != 0) return;
+        if (self.px.len != 0) self.allocator.free(self.px);
+        self.px = try self.allocator.alloc(u8, @intCast(@max(1, w * h)));
+        self.px_w = w;
+        self.px_h = h;
+    }
+
+    fn clearCanvas(self: *Game) void {
+        @memset(self.px, 0);
+    }
+
+    fn setPx(self: *Game, x: i32, y: i32, color: u8) void {
+        if (x < 0 or y < 0 or x >= self.px_w or y >= self.px_h) return;
+        self.px[@intCast(y * self.px_w + x)] = color;
+    }
+
+    fn getPx(self: *Game, x: i32, y: i32) u8 {
+        if (x < 0 or y < 0 or x >= self.px_w or y >= self.px_h) return 0;
+        return self.px[@intCast(y * self.px_w + x)];
+    }
+
+    fn blit(self: *Game, art: Art, x0: i32, y0: i32, color: u8) void {
+        const w = artW(art, self.half);
+        const h = artH(art, self.half);
+        if (x0 + w < 0 or x0 >= self.px_w) return;
+        var y: i32 = 0;
+        while (y < h) : (y += 1) {
+            const py = y0 + y;
+            if (py < 0 or py >= self.px_h) continue;
+            var x: i32 = 0;
+            while (x < w) : (x += 1) {
+                if (artPixel(art, x, y, self.half)) self.setPx(x0 + x, py, color);
             }
         }
     }
 };
 
-fn boxesOverlap(a: anytype, b: anytype) bool {
+fn rectsOverlap(a: Rect, b: Rect) bool {
     return a.x < b.x + b.w and a.x + a.w > b.x and a.y < b.y + b.h and a.y + a.h > b.y;
 }
 
@@ -503,13 +947,19 @@ fn nowNs() i128 {
     return @as(i128, ts.sec) * 1000000000 + @as(i128, ts.nsec);
 }
 
+/// Wall clock seconds, for stamping a run in the history file.
+fn unixNow() i64 {
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 fn getWinsize() struct { rows: i32, cols: i32 } {
     var wsz: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
     const rc = c.ioctl(STDOUT_FD, c.T.IOCGWINSZ, @intFromPtr(&wsz));
     if (rc == 0 and wsz.col != 0 and wsz.row != 0) {
         return .{ .rows = @intCast(wsz.row), .cols = @intCast(wsz.col) };
     }
-    // try stdin
     const rc2 = c.ioctl(STDIN_FD, c.T.IOCGWINSZ, @intFromPtr(&wsz));
     if (rc2 == 0 and wsz.col != 0 and wsz.row != 0) {
         return .{ .rows = @intCast(wsz.row), .cols = @intCast(wsz.col) };
@@ -521,7 +971,6 @@ fn enableRawMode() !posix.termios {
     const orig = try posix.tcgetattr(STDIN_FD);
     var raw = orig;
 
-    // input flags – turn off all the cooking
     raw.iflag.BRKINT = false;
     raw.iflag.ICRNL = false;
     raw.iflag.IGNBRK = false;
@@ -534,23 +983,16 @@ fn enableRawMode() !posix.termios {
     raw.iflag.INPCK = false;
     raw.iflag.PARMRK = false;
 
-    // output flags
     raw.oflag.OPOST = false;
-
-    // control flags – 8 bit
     raw.cflag.CSIZE = .CS8;
 
-    // local flags
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
     raw.lflag.ISIG = false;
     raw.lflag.IEXTEN = false;
 
-    // cc – VMIN / VTIME for non-blocking read via poll
-    // on macos NCCS 20, VMIN is index 16, VTIME 17
     raw.cc[16] = 0; // VMIN
-    raw.cc[17] = 1; // VTIME (1 = 100ms, but we poll anyway)
-    // alternative: both 0 for immediate
+    raw.cc[17] = 1; // VTIME
 
     try posix.tcsetattr(STDIN_FD, .NOW, raw);
     return orig;
@@ -560,7 +1002,6 @@ fn disableRawMode(orig: posix.termios) void {
     posix.tcsetattr(STDIN_FD, .NOW, orig) catch {};
 }
 
-// write helper – single syscall
 fn writeAll(fd: posix.fd_t, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
@@ -571,7 +1012,6 @@ fn writeAll(fd: posix.fd_t, bytes: []const u8) void {
     }
 }
 
-// ANSI helpers
 fn hideCursor(buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
     try buf.appendSlice(alloc, "\x1b[?25l");
 }
@@ -588,406 +1028,439 @@ fn clearScreen(buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
     try buf.appendSlice(alloc, "\x1b[2J\x1b[H");
 }
 fn moveTo(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, row: i32, col: i32) !void {
-    // terminal is 1-indexed
     try buf.print(alloc, "\x1b[{d};{d}H", .{ row + 1, col + 1 });
 }
 
 // ---------------------------------------------------------------------------
 // Input
+//
+// A terminal reports no key-up events, so "is the duck key still held?" has to
+// be inferred from the keyboard's auto-repeat. The naive version - duck for a
+// few frames per keypress - stutters, because the terminal waits ~600ms before
+// the first repeat: duck, stand, duck.
+//
+// So the hold window is adaptive. The first press holds long enough to bridge
+// that delay; once repeats are actually arriving the window shrinks, so letting
+// go feels immediate. A release event is honoured if one ever shows up, but
+// nothing depends on it.
 // ---------------------------------------------------------------------------
+
+const DUCK_FIRST_MS: i128 = 800;
+const DUCK_REPEAT_MS: i128 = 200;
+
+// sentinels for keys that are not unicode code points
+const KEY_UP: u32 = 0xE000;
+const KEY_DOWN: u32 = 0xE001;
+
 const Input = struct {
     jump: bool = false,
-    duck: bool = false,
-    duck_hold: bool = false,
     quit: bool = false,
     restart: bool = false,
 };
 
-fn pollInput() Input {
+const InputState = struct {
+    duck_held: bool = false,
+    duck_expire: i128 = 0,
+};
+
+fn isCsiFinal(b: u8) bool {
+    return b >= 0x40 and b <= 0x7e;
+}
+
+fn parseU32(s: []const u8) u32 {
+    return std.fmt.parseInt(u32, s, 10) catch 0;
+}
+
+fn isDuckKey(code: u32) bool {
+    return code == KEY_DOWN or code == 's' or code == 'S' or code == 'j' or code == 'J';
+}
+
+fn isJumpKey(code: u32) bool {
+    return code == KEY_UP or code == ' ' or code == 'w' or code == 'W' or code == 'k' or code == 'K';
+}
+
+fn handleKey(st: *InputState, inp: *Input, code: u32, event: u32) void {
+    const released = event == 3;
+
+    if (isDuckKey(code)) {
+        if (released) {
+            st.duck_held = false;
+        } else {
+            const window: i128 = if (st.duck_held) DUCK_REPEAT_MS else DUCK_FIRST_MS;
+            st.duck_held = true;
+            st.duck_expire = nowNs() + window * 1_000_000;
+        }
+        return;
+    }
+
+    if (released) return;
+
+    // any other key means the duck key is not the one being held
+    st.duck_held = false;
+
+    if (isJumpKey(code)) {
+        inp.jump = true;
+    } else if (code == '\r' or code == '\n') {
+        inp.jump = true;
+        inp.restart = true;
+    } else if (code == 'q' or code == 'Q' or code == 3) {
+        inp.quit = true;
+    } else if (code == 'r' or code == 'R') {
+        inp.restart = true;
+    }
+}
+
+fn handleCsi(st: *InputState, inp: *Input, params: []const u8, final: u8) void {
+    if (params.len != 0 and (params[0] == '?' or params[0] == '>' or params[0] == '<')) return;
+
+    // "<key>;<mods>:<event>" - the event type, when present, is a sub-parameter
+    var event: u32 = 1;
+    var key: u32 = 0;
+    var parts = std.mem.splitScalar(u8, params, ';');
+    if (parts.next()) |p0| {
+        var subs = std.mem.splitScalar(u8, p0, ':');
+        key = parseU32(subs.next() orelse "");
+    }
+    if (parts.next()) |p1| {
+        var subs = std.mem.splitScalar(u8, p1, ':');
+        _ = subs.next();
+        if (subs.next()) |ev| event = parseU32(ev);
+    }
+
+    switch (final) {
+        'A' => handleKey(st, inp, KEY_UP, event),
+        'B' => handleKey(st, inp, KEY_DOWN, event),
+        'u' => handleKey(st, inp, key, event),
+        else => {},
+    }
+}
+
+fn pollInput(st: *InputState) Input {
     var inp = Input{};
     var fds = [_]posix.pollfd{.{ .fd = STDIN_FD, .events = posix.POLL.IN, .revents = 0 }};
     const n = posix.poll(&fds, 0) catch 0;
-    if (n == 0) return inp;
-    if (fds[0].revents & posix.POLL.IN == 0) return inp;
 
-    var buf: [64]u8 = undefined;
-    const read_n = posix.read(STDIN_FD, &buf) catch 0;
-    if (read_n == 0) return inp;
-    var i: usize = 0;
-    while (i < read_n) : (i += 1) {
-        const ch = buf[i];
-        switch (ch) {
-            3, // Ctrl-C
-            27 => { // ESC – could be arrow
-                // check if next bytes are '[' 'A' etc
-                if (i + 2 < read_n and buf[i + 1] == '[') {
-                    const arrow = buf[i + 2];
-                    if (arrow == 'A') { // up
-                        inp.jump = true;
-                        i += 2;
-                    } else if (arrow == 'B') { // down
-                        inp.duck = true;
-                        inp.duck_hold = true;
-                        i += 2;
-                    } else if (arrow == 'C') {
-                        // right – ignore
-                        i += 2;
-                    } else if (arrow == 'D') {
-                        i += 2;
-                    }
-                } else {
-                    // lone ESC = quit
-                    inp.quit = true;
-                }
-            },
-            ' ', 'w', 'W', 'k', 'K' => inp.jump = true,
-            '\r', '\n' => {
-                inp.jump = true;
-                inp.restart = true;
-            },
-            's', 'S', 'j', 'J' => {
-                inp.duck = true;
-                inp.duck_hold = true;
-            },
-            'q', 'Q' => inp.quit = true,
-            'r', 'R' => inp.restart = true,
-            else => {},
+    if (n != 0 and fds[0].revents & posix.POLL.IN != 0) {
+        var buf: [128]u8 = undefined;
+        const read_n = posix.read(STDIN_FD, &buf) catch 0;
+        var i: usize = 0;
+        while (i < read_n) {
+            const ch = buf[i];
+            if (ch == 0x1b and i + 1 < read_n and buf[i + 1] == '[') {
+                var j = i + 2;
+                while (j < read_n and !isCsiFinal(buf[j])) : (j += 1) {}
+                if (j >= read_n) break; // truncated sequence, drop the tail
+                handleCsi(st, &inp, buf[i + 2 .. j], buf[j]);
+                i = j + 1;
+                continue;
+            }
+            // a lone ESC quits, but only when it is the whole read - otherwise
+            // it is the head of an escape sequence split across reads
+            if (ch == 0x1b and read_n == 1) {
+                inp.quit = true;
+                i += 1;
+                continue;
+            }
+            handleKey(st, &inp, ch, 1);
+            i += 1;
         }
-        if (ch == 'q' or ch == 'Q') inp.quit = true;
     }
-    // For duck hold detection: if any duck key seen, set hold.
-    // Terminal autorepeat will keep sending 's' while held.
+
+    if (st.duck_held and nowNs() > st.duck_expire) st.duck_held = false;
     return inp;
 }
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+/// Chrome paints its own canvas, so day is light with dark sprites and the
+/// night flip inverts both. Painting the background is what makes the flip
+/// visible at all - sprite colours alone do nothing on a dark terminal.
+fn bgCode(inverted: bool) []const u8 {
+    return if (inverted) "\x1b[48;5;233m" else "\x1b[48;5;255m";
+}
+
+fn colorCode(id: u8, inverted: bool) []const u8 {
+    if (inverted) return switch (id) {
+        C_CACTUS => "\x1b[38;5;108m",
+        C_CLOUD => "\x1b[38;5;240m",
+        else => "\x1b[38;5;253m",
+    };
+    return switch (id) {
+        C_DINO => "\x1b[38;5;240m", // chrome's #535353
+        C_CACTUS => "\x1b[38;5;65m",
+        C_CLOUD => "\x1b[38;5;249m",
+        C_GROUND => "\x1b[38;5;240m",
+        else => "\x1b[38;5;240m",
+    };
+}
+
+/// Draw the whole world into the pixel canvas.
+fn compose(game: *Game) void {
+    game.clearCanvas();
+
+    const gpy = game.groundPy();
+
+    // clouds
+    for (game.clouds.items) |cl| {
+        const cx: i32 = @intFromFloat(@round(cl.x));
+        game.blit(&CLOUD, cx, cl.y, C_CLOUD);
+    }
+
+    // ground: one solid line plus chrome's scattered pebbles
+    {
+        const scroll: i32 = @intFromFloat(@floor(game.ground_scroll));
+        const ground_w = game.introGroundW();
+        var x: i32 = 0;
+        while (x < ground_w) : (x += 1) {
+            game.setPx(x, gpy, C_GROUND);
+            const p = @mod(x + scroll, 43);
+            if (p == 0 or p == 1) game.setPx(x, gpy - 1, C_GROUND);
+            const q = @mod(x + scroll, 97);
+            if (q == 0) game.setPx(x, gpy + 1, C_GROUND);
+        }
+    }
+
+    // obstacles
+    for (game.obstacles.items) |o| {
+        const art = game.obstacleArt(o);
+        const ox: i32 = @intFromFloat(@round(o.x));
+        const oy = game.obstacleTopPy(o);
+        const step = artW(art, game.half) + game.cactusGap();
+        var n: i32 = 0;
+        while (n < @as(i32, @intCast(o.count))) : (n += 1) {
+            game.blit(art, ox + n * step, oy, C_CACTUS);
+        }
+    }
+
+    // dino
+    {
+        const art = game.dinoArt();
+        game.blit(art, game.dinoX(), game.dinoTopPy(art), C_DINO);
+    }
+
+    // chrome's restart button, on the game over screen
+    if (game.state == .game_over) {
+        const iw = artW(&RESTART, game.half);
+        const ix = @divFloor(game.width - iw, 2);
+        const iy = (@divFloor(game.height, 2) - 3) * 2; // sits above the dino
+        game.blit(&RESTART, ix, iy, C_DINO);
+    }
+}
+
+/// Flush the pixel canvas as half-block characters.
+fn emit(game: *Game, buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
+    const bg = bgCode(game.inverted);
+    var cur: u8 = 0;
+    var r: i32 = 0;
+    while (r < game.height) : (r += 1) {
+        const top_y = r * 2;
+        const bot_y = r * 2 + 1;
+        var last: i32 = -1;
+        var x: i32 = 0;
+        while (x < game.width) : (x += 1) {
+            if (game.getPx(x, top_y) != 0 or game.getPx(x, bot_y) != 0) last = x;
+        }
+        try moveTo(buf, alloc, r, 0);
+        try buf.appendSlice(alloc, bg);
+        cur = 0;
+        x = 0;
+        while (x <= last) : (x += 1) {
+            const t = game.getPx(x, top_y);
+            const b = game.getPx(x, bot_y);
+            if (t == 0 and b == 0) {
+                try buf.append(alloc, ' ');
+                continue;
+            }
+            const col: u8 = if (t != 0) t else b;
+            if (col != cur) {
+                try buf.appendSlice(alloc, colorCode(col, game.inverted));
+                cur = col;
+            }
+            if (t != 0 and b != 0) {
+                try buf.appendSlice(alloc, "\u{2588}");
+            } else if (t != 0) {
+                try buf.appendSlice(alloc, "\u{2580}");
+            } else {
+                try buf.appendSlice(alloc, "\u{2584}");
+            }
+        }
+        // erase-to-end fills with the background we just set
+        try buf.appendSlice(alloc, "\x1b[K");
+    }
+}
+
 fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
     const alloc = game.allocator;
     buf.clearRetainingCapacity();
-    // we render directly with ANSI cursor moves – no need to clear each cell
-    // start frame
-    try buf.appendSlice(alloc, "\x1b[H"); // home
+    try buf.appendSlice(alloc, "\x1b[H");
 
     const w = game.width;
     const h = game.height;
-    const gy = game.groundY();
 
-    // colors – chrome uses #535353 grey, inverted is white on black
-    const fg = if (game.inverted) "\x1b[97m" else "\x1b[90m";
-    const cactus_fg = if (game.inverted) "\x1b[97m" else "\x1b[32m";
-    const dino_fg = if (game.inverted) "\x1b[97;1m" else "\x1b[37;1m";
-    const cloud_fg = "\x1b[37m";
-    const dim = "\x1b[2m";
+    const bg = bgCode(game.inverted);
+    const ink = colorCode(C_DINO, game.inverted);
+    const faint = if (game.inverted) "\x1b[38;5;242m" else "\x1b[38;5;248m";
     const reset = "\x1b[0m";
 
-    // if too small, show message centered
-    if (w < 40 or h < 12) {
+    if (w < 40 or h < 14) {
         try clearScreen(buf, alloc);
-        try buf.appendSlice(alloc, fg);
-        const msg = " TERMINAL TOO SMALL – enlarge to play ";
+        const msg = " TERMINAL TOO SMALL - enlarge to play ";
         const row = @divFloor(h, 2);
         const col = @max(0, @divFloor(w - @as(i32, @intCast(msg.len)), 2));
         try moveTo(buf, alloc, row, col);
         try buf.appendSlice(alloc, msg);
-        try buf.appendSlice(alloc, reset);
         return;
     }
 
-    // ---- background fill (optional inverted) ----
-    if (game.inverted) {
-        // fill with inverted background illusion – set reverse video
-        try buf.appendSlice(alloc, "\x1b[40m\x1b[2J\x1b[H");
-    } else {
-        // normal – clear
-        try buf.appendSlice(alloc, "\x1b[49m\x1b[2J\x1b[H");
-    }
+    try game.ensureCanvas();
+    compose(game);
+    try emit(game, buf, alloc);
 
-    // ---- score header (top right) ----
-    // Chrome format: HI 00000  00000
+    // every overlay repaints the background, otherwise it punches a hole in the
+    // canvas with the terminal's own colours
+    const label = struct {
+        fn at(b: *std.ArrayList(u8), a: std.mem.Allocator, bgc: []const u8, fgc: []const u8, row: i32, col: i32, text: []const u8) !void {
+            try moveTo(b, a, row, @max(0, col));
+            try b.appendSlice(a, bgc);
+            try b.appendSlice(a, fgc);
+            try b.appendSlice(a, text);
+        }
+        fn centered(b: *std.ArrayList(u8), a: std.mem.Allocator, bgc: []const u8, fgc: []const u8, row: i32, width: i32, text: []const u8) !void {
+            const col = @divFloor(width - @as(i32, @intCast(text.len)), 2);
+            try at(b, a, bgc, fgc, row, col, text);
+        }
+    };
+
+    // ---- score header (top right), blinking on every hundred ----
     {
         var score_buf: [32]u8 = undefined;
-        const score_str = try std.fmt.bufPrint(&score_buf, "{d:0>5}", .{game.score});
         var hi_buf: [32]u8 = undefined;
-        const hi_str = try std.fmt.bufPrint(&hi_buf, "{d:0>5}", .{game.hi_score});
-        const header = try std.fmt.allocPrint(alloc, "HI {s}  {s}", .{ hi_str, score_str });
-        defer alloc.free(header);
-        try buf.appendSlice(alloc, fg);
-        try buf.appendSlice(alloc, dim);
-        // right align
-        const col = w - @as(i32, @intCast(header.len)) - 2;
-        try moveTo(buf, alloc, 0, col);
-        try buf.appendSlice(alloc, header);
-        try buf.appendSlice(alloc, reset);
-    }
+        const score_str = try std.fmt.bufPrint(&score_buf, "{d:0>5}", .{game.score});
+        const hi_str = try std.fmt.bufPrint(&hi_buf, "HI {d:0>5}", .{game.hi_score});
 
-    // ---- speed indicator (optional) ----
-    // tiny speed bar under score? not needed
-
-    // ---- clouds ----
-    try buf.appendSlice(alloc, cloud_fg);
-    for (game.clouds.items) |cl| {
-        const cx: i32 = @intFromFloat(@round(cl.x));
-        if (cx < -4 or cx >= w) continue;
-        try moveTo(buf, alloc, cl.y, cx);
-        // clip cloud to screen
-        const cloud_str = CLOUD;
-        const avail = w - cx;
-        if (avail >= 3) {
-            try buf.appendSlice(alloc, cloud_str);
-        } else if (avail > 0) {
-            try buf.appendSlice(alloc, cloud_str[0..@intCast(avail * 3)]); // rough – 3 bytes per cloud char
+        const col = w - @as(i32, @intCast(hi_str.len + score_str.len)) - 4;
+        try label.at(buf, alloc, bg, faint, 0, col, hi_str);
+        if (game.scoreVisible()) {
+            try label.at(buf, alloc, bg, ink, 0, col + @as(i32, @intCast(hi_str.len)) + 2, score_str);
         }
-    }
-    try buf.appendSlice(alloc, reset);
-
-    // ---- ground ----
-    try buf.appendSlice(alloc, fg);
-    // draw solid ground line
-    try moveTo(buf, alloc, gy, 0);
-    // build ground line with scroll texture: pattern "─▁──▁"
-    var ground_line: [512]u8 = undefined;
-    const glen: usize = @min(@as(usize, @intCast(w)), ground_line.len);
-    var gi: usize = 0;
-    const offset: usize = @intFromFloat(@mod(game.ground_scroll, 12));
-    while (gi < glen) : (gi += 1) {
-        const pattern_idx = (gi + offset) % 12;
-        // simple dotted ground like chrome: ─ ─ · ·
-        if (pattern_idx == 3 or pattern_idx == 7 or pattern_idx == 11) {
-            // small bump – use 3-byte utf8 for ▁ (e2 96 81) – ascii fallback '.'
-            if (gi + 2 < glen) {
-                // we use ascii '.' to avoid multibyte messing alignment – but keep utf8 for style?
-                // Use '_' for bump
-                ground_line[gi] = '_';
-            } else {
-                ground_line[gi] = '-';
-            }
-        } else {
-            ground_line[gi] = '-';
-        }
-    }
-    // Ground uses '-' and '_' – single byte, simple
-    try buf.appendSlice(alloc, ground_line[0..glen]);
-    // ground bottom padding (chrome has solid line + second pixel?)
-    if (gy + 1 < h) {
-        try moveTo(buf, alloc, gy + 1, 0);
-        var j: usize = 0;
-        while (j < glen) : (j += 1) {
-            ground_line[j] = ' ';
-        }
-        try buf.appendSlice(alloc, ground_line[0..glen]);
-    }
-    try buf.appendSlice(alloc, reset);
-
-    // ---- obstacles ----
-    for (game.obstacles.items) |o| {
-        const ox: i32 = @intFromFloat(@round(o.x));
-        if (ox + o.w < 0 or ox >= w) continue;
-        const is_ptero = o.kind == .ptero_low or o.kind == .ptero_mid or o.kind == .ptero_high;
-        // pick sprite
-        var sprite: []const []const u8 = &.{};
-        var sprite_h: i32 = o.h;
-        if (is_ptero) {
-            // animate flap every 10 frames
-            const flap = (game.frame / 8) % 2 == 0;
-            sprite = if (flap) &PTERO_A else &PTERO_B;
-            sprite_h = 2;
-        } else {
-            switch (o.kind) {
-                .cactus_small_single => {
-                    sprite = &CACTUS_SMALL_SINGLE;
-                    sprite_h = 3;
-                },
-                .cactus_small_double => {
-                    sprite = &CACTUS_SMALL_DOUBLE;
-                    sprite_h = 3;
-                },
-                .cactus_small_triple => {
-                    sprite = &CACTUS_SMALL_TRIPLE;
-                    sprite_h = 3;
-                },
-                .cactus_large_single => {
-                    sprite = &CACTUS_LARGE_SINGLE;
-                    sprite_h = 4;
-                },
-                .cactus_large_double => {
-                    sprite = &CACTUS_LARGE_DOUBLE;
-                    sprite_h = 4;
-                },
-                .cactus_large_triple => {
-                    sprite = &CACTUS_LARGE_TRIPLE;
-                    sprite_h = 4;
-                },
-                else => {
-                    sprite = &CACTUS_SMALL_SINGLE;
-                    sprite_h = 3;
-                },
-            }
-        }
-        try buf.appendSlice(alloc, cactus_fg);
-        // obstacles y: ground-relative or ptero absolute
-        const oy: i32 = if (is_ptero) o.y else gy - sprite_h + 1;
-        var row: i32 = 0;
-        while (row < sprite_h) : (row += 1) {
-            const y = oy + row;
-            if (y < 0 or y >= h) continue;
-            const line = sprite[@intCast(row)];
-            // clip horizontally
-            if (ox < 0) {
-                // compute byte offset – tricky with utf8, but cactus uses ascii/block? Our sprites are single-byte plus block (3 bytes)
-                // For simplicity, skip offscreen left clipping by char count – approximate
-                const skip: usize = @intCast(-ox);
-                // Find byte offset for char skip – count chars (each char may be 1 or 3 bytes for block)
-                // Our cactus sprites use ' ' (1), '█' (3 bytes), etc. Simpler: just not clip left, just draw if ox>=0.
-                // To keep simple, just skip drawing when ox<0 and shift
-                // We'll fallback to not drawing left-clipped – just start at col 0 with truncated string
-                // Calculate char length?
-                // Easier: use moveTo at 0 and slice string after skip – but byte length ≠ char length.
-                // We'll just skip this obstacle when partially off left to avoid corruption – not perfect but fine
-                if (ox != 0) continue;
-                try moveTo(buf, alloc, y, 0);
-                // attempt to slice by byte – may cut block char but okay
-                const start = @min(skip * 3, line.len);
-                if (start < line.len) {
-                    const remain = line[start..];
-                    const max_len = @min(remain.len, @as(usize, @intCast(w)));
-                    try buf.appendSlice(alloc, remain[0..max_len]);
-                }
-            } else {
-                const avail: i32 = w - ox;
-                if (avail <= 0) continue;
-                try moveTo(buf, alloc, y, ox);
-                // clip to avail characters – approximate by byte length; just truncate byte-wise but keep within width
-                // Estimate max bytes: avail * 3 (worst case block)
-                const max_bytes: usize = @intCast(avail * 3);
-                const to_write: usize = @min(line.len, max_bytes);
-                // but we need to avoid cutting utf8 in middle – just write whole line if it fits, else trim at char boundary
-                // Simpler: write line, terminal will clip.
-                try buf.appendSlice(alloc, line[0..to_write]);
-            }
-        }
-        try buf.appendSlice(alloc, reset);
-    }
-
-    // ---- dino ----
-    {
-        try buf.appendSlice(alloc, dino_fg);
-        const is_dead = game.state == .game_over;
-        var dino_sprite: []const []const u8 = undefined;
-        var dh: i32 = DINO_HEIGHT;
-        if (is_dead) {
-            dino_sprite = &DINO_DEAD;
-            dh = 4;
-        } else if (!game.on_ground) {
-            dino_sprite = &DINO_JUMP;
-            dh = 4;
-        } else if (game.ducking) {
-            const flap = (game.frame / 6) % 2 == 0;
-            dino_sprite = if (flap) &DINO_DUCK_A else &DINO_DUCK_B;
-            dh = 3;
-        } else if (game.state == .idle) {
-            dino_sprite = &DINO_RUN_A;
-            dh = 4;
-        } else {
-            const flap = (game.frame / 5) % 2 == 0;
-            dino_sprite = if (flap) &DINO_RUN_A else &DINO_RUN_B;
-            dh = 4;
-        }
-        const dy = game.dinoTopY();
-        // dino may be clipped if jumping off screen top – handle
-        var r: i32 = 0;
-        while (r < dh) : (r += 1) {
-            const y = dy + r;
-            if (y < 0 or y >= h) continue;
-            const line = dino_sprite[@intCast(r)];
-            try moveTo(buf, alloc, y, DINO_X);
-            try buf.appendSlice(alloc, line);
-        }
-        try buf.appendSlice(alloc, reset);
-        // optional hitbox debug: uncomment to see
-        // if (game.frame % 10 == 0) {}
     }
 
     // ---- UI overlays ----
     if (game.state == .idle) {
-        const msg = if (game.blink) "  Press SPACE / ↑ to start  " else "                            ";
-        const hint = "  ↓ to duck | Q to quit  ";
-        const r1 = @divFloor(h, 2) + 2;
-        const c1 = @max(0, @divFloor(w - @as(i32, @intCast(msg.len)), 2));
-        const c2 = @max(0, @divFloor(w - @as(i32, @intCast(hint.len)), 2));
-        try buf.appendSlice(alloc, "\x1b[97;1m");
-        try moveTo(buf, alloc, r1, c1);
-        try buf.appendSlice(alloc, msg);
-        try buf.appendSlice(alloc, reset);
-        try buf.appendSlice(alloc, dim);
-        try moveTo(buf, alloc, r1 + 1, c2);
-        try buf.appendSlice(alloc, hint);
-        try buf.appendSlice(alloc, reset);
-
-        // title
-        const title = " CHROME DINO ";
-        const title_col = @max(0, @divFloor(w - @as(i32, @intCast(title.len)), 2));
-        try moveTo(buf, alloc, 2, title_col);
-        try buf.appendSlice(alloc, "\x1b[1m");
-        try buf.appendSlice(alloc, title);
-        try buf.appendSlice(alloc, reset);
+        try label.centered(buf, alloc, bg, ink, 2, w, " CHROME DINO ");
+        if (game.blink) {
+            try label.centered(buf, alloc, bg, ink, @divFloor(h, 2) + 2, w, "Press SPACE / UP to start");
+        }
+        try label.centered(buf, alloc, bg, faint, @divFloor(h, 2) + 3, w, "DOWN to duck  |  Q to quit");
     } else if (game.state == .game_over) {
-        const over = " G A M E  O V E R ";
-        const over_col = @max(0, @divFloor(w - @as(i32, @intCast(over.len)), 2));
-        const r = @divFloor(h, 2) - 2;
-        try moveTo(buf, alloc, r, over_col);
-        try buf.appendSlice(alloc, "\x1b[91;1m");
-        try buf.appendSlice(alloc, over);
-        try buf.appendSlice(alloc, reset);
+        const mid = @divFloor(h, 2);
+        try label.centered(buf, alloc, bg, ink, @max(0, mid - 6), w, "G A M E   O V E R");
 
-        const score_msg = try std.fmt.allocPrint(alloc, " Score: {d}  HI: {d} ", .{ game.score, game.hi_score });
-        defer alloc.free(score_msg);
-        const sc_col = @max(0, @divFloor(w - @as(i32, @intCast(score_msg.len)), 2));
-        try moveTo(buf, alloc, r + 1, sc_col);
-        try buf.appendSlice(alloc, dim);
-        try buf.appendSlice(alloc, score_msg);
-        try buf.appendSlice(alloc, reset);
+        var sc_buf: [64]u8 = undefined;
+        const sc = try std.fmt.bufPrint(&sc_buf, "{d:0>5}   HI {d:0>5}", .{ game.score, game.hi_score });
+        try label.centered(buf, alloc, bg, faint, @max(1, mid - 4), w, sc);
 
-        const restart = if (game.blink) " Press SPACE or R to restart " else "                             ";
-        const rc = @max(0, @divFloor(w - @as(i32, @intCast(restart.len)), 2));
-        try moveTo(buf, alloc, r + 3, rc);
-        try buf.appendSlice(alloc, "\x1b[97;1m");
-        try buf.appendSlice(alloc, restart);
-        try buf.appendSlice(alloc, reset);
-
-        const quit_msg = " Q to quit ";
-        const qc = @max(0, @divFloor(w - @as(i32, @intCast(quit_msg.len)), 2));
-        try moveTo(buf, alloc, r + 4, qc);
-        try buf.appendSlice(alloc, dim);
-        try buf.appendSlice(alloc, quit_msg);
-        try buf.appendSlice(alloc, reset);
+        // the restart icon itself is drawn into the canvas by compose(); the
+        // hint goes to the footer so nothing sits on top of the playfield
+        try label.at(buf, alloc, bg, faint, h - 1, 1, "SPACE or R to restart   Q to quit");
     }
 
-    // ---- footer with controls hint when playing (subtle) ----
-    if (game.state == .playing) {
-        const footer = "SPACE/↑ jump  ↓ duck  Q quit";
-        const fc = @max(0, w - @as(i32, @intCast(footer.len)) - 1);
-        try moveTo(buf, alloc, h - 1, fc);
-        try buf.appendSlice(alloc, "\x1b[90;2m");
-        // only show if width allows
-        if (w > 40) try buf.appendSlice(alloc, footer);
-        try buf.appendSlice(alloc, reset);
+    if (game.state == .playing and w > 44) {
+        const footer = "SPACE/UP jump   DOWN duck   Q quit";
+        try label.at(buf, alloc, bg, faint, h - 1, w - @as(i32, @intCast(footer.len)) - 1, footer);
     }
 
-    // ensure cursor at bottom
+    try buf.appendSlice(alloc, reset);
     try moveTo(buf, alloc, h - 1, 0);
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-pub fn main() !void {
+/// `DINO_KEYS=1 dino`: dump what the terminal actually sends, with timings. Exists
+/// because "the duck key sticks" can only be explained by the terminal, and
+/// that is invisible from inside the game loop.
+fn dumpKeys() !void {
+    const orig = enableRawMode() catch |e| {
+        std.debug.print("failed to enable raw mode: {any}\n", .{e});
+        return;
+    };
+    defer disableRawMode(orig);
+
+    var out: [4096]u8 = undefined;
+    const banner = "key dump - press keys (hold the duck key too), q to quit\r\n\r\n";
+    writeAll(STDOUT_FD, banner);
+
+    const start = nowNs();
+    while (true) {
+        var fds = [_]posix.pollfd{.{ .fd = STDIN_FD, .events = posix.POLL.IN, .revents = 0 }};
+        const n = posix.poll(&fds, 5000) catch 0;
+        if (n == 0) continue;
+
+        var buf: [128]u8 = undefined;
+        const read_n = posix.read(STDIN_FD, &buf) catch 0;
+        if (read_n == 0) continue;
+
+        const ms = @divTrunc(nowNs() - start, 1_000_000);
+        var w: usize = 0;
+        var line = try std.fmt.bufPrint(out[w..], "{d:>6}ms  {d:>2} bytes  ", .{ ms, read_n });
+        w += line.len;
+        for (buf[0..read_n]) |b| {
+            line = if (b == 0x1b)
+                try std.fmt.bufPrint(out[w..], "ESC ", .{})
+            else if (b >= 0x20 and b < 0x7f)
+                try std.fmt.bufPrint(out[w..], "{c} ", .{b})
+            else
+                try std.fmt.bufPrint(out[w..], "\\x{x:0>2} ", .{b});
+            w += line.len;
+        }
+        line = try std.fmt.bufPrint(out[w..], "\r\n", .{});
+        w += line.len;
+        writeAll(STDOUT_FD, out[0..w]);
+
+        if (std.mem.indexOfScalar(u8, buf[0..read_n], 'q') != null) break;
+    }
+    writeAll(STDOUT_FD, "\r\n");
+}
+
+const USAGE =
+    \\dino - the chrome offline runner, in your terminal
+    \\
+    \\  dino          play
+    \\  dino view     stats from every run you have played
+    \\  dino keys     dump what your terminal sends for each key
+    \\  dino help     this
+    \\
+    \\history lives in $DINO_HISTORY, else $XDG_DATA_HOME/dino/history.tsv
+    \\
+;
+
+fn viewHistory(alloc: std.mem.Allocator) !void {
+    const runs = history.load(alloc) catch &.{};
+    defer if (runs.len != 0) alloc.free(runs);
+    const text = try history.report(alloc, runs);
+    defer alloc.free(text);
+    writeAll(STDOUT_FD, text);
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Check if stdin is tty – if not, can't play (but allow build)
+    {
+        var args = std.process.Args.Iterator.init(init.args);
+        _ = args.next(); // argv[0]
+        if (args.next()) |cmd| {
+            if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "stats")) return viewHistory(alloc);
+            if (std.mem.eql(u8, cmd, "keys")) return dumpKeys();
+            writeAll(STDOUT_FD, USAGE);
+            return;
+        }
+    }
+    if (c.getenv("DINO_KEYS") != null) return dumpKeys();
+
     const is_tty = c.isatty(STDIN_FD) != 0;
     if (!is_tty) {
         std.debug.print("Not a TTY. Please run in a terminal.\n", .{});
@@ -999,32 +1472,29 @@ pub fn main() !void {
     defer game.deinit();
     game.reset();
 
-    // terminal setup
     const orig = enableRawMode() catch |e| {
         std.debug.print("failed to enable raw mode: {any}\n", .{e});
         return;
     };
     defer disableRawMode(orig);
 
-    // alt screen + hide cursor
+    var input_state: InputState = .{};
+
     var tmp_buf: std.ArrayList(u8) = .empty;
     defer tmp_buf.deinit(alloc);
 
-    // build initial alt/hide sequence
     tmp_buf.clearRetainingCapacity();
     try enterAlt(&tmp_buf, alloc);
     try hideCursor(&tmp_buf, alloc);
-    try bufAppend(&tmp_buf, alloc, "\x1b[2J\x1b[H");
+    try tmp_buf.appendSlice(alloc, "\x1b[2J\x1b[H");
     writeAll(STDOUT_FD, tmp_buf.items);
 
     defer {
-        // restore on exit
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(alloc);
         out.appendSlice(alloc, "\x1b[0m") catch {};
         showCursor(&out, alloc) catch {};
         leaveAlt(&out, alloc) catch {};
-        // also reset attributes
         writeAll(STDOUT_FD, out.items);
         disableRawMode(orig);
     }
@@ -1036,103 +1506,70 @@ pub fn main() !void {
     var acc: i128 = 0;
 
     var running = true;
+    var was_over = false;
     while (running) {
         const now: i128 = nowNs();
         var delta: i128 = now - last_time;
         last_time = now;
-        // clamp delta to avoid spiral if terminal lag
         if (delta > 100_000_000) delta = 100_000_000;
         if (delta < 0) delta = 0;
         acc += delta;
 
-        // poll input each iteration
-        var jump = false;
-        var duck = false;
-        var duck_hold = false;
-        var should_quit = false;
-        var should_restart = false;
+        const inp = pollInput(&input_state);
+        var jump = inp.jump;
 
-        // we need to consume all pending input – pollInput already reads all buffered
-        const inp = pollInput();
-        jump = inp.jump;
-        duck = inp.duck;
-        duck_hold = inp.duck_hold;
-        should_quit = inp.quit;
-        should_restart = inp.restart;
-
-        if (should_quit) {
+        if (inp.quit) {
+            if (game.takeRun(false)) |run| history.append(run);
             running = false;
             break;
         }
 
-        // handle restart when game over
-        if (game.state == .game_over and (jump or should_restart)) {
-            // keep hi score
+        if (game.state == .game_over and (jump or inp.restart)) {
             const hi = game.hi_score;
-            // full reset but hide old obstacles
             game.reset();
             game.hi_score = hi;
-            // tiny delay to avoid immediate collision
-            game.state = .playing;
-            game.frame = 0;
-            // play jump to start
+            game.startRun();
+            jump = false;
         }
 
-        // also handle 'r' restart mid-game? allow reset to idle?
-        // not needed
-
-        // check winsize occasionally (every 30 frames)
         if (game.frame % 30 == 0) {
             ws = getWinsize();
-            game.width = ws.cols;
-            game.height = ws.rows;
+            if (ws.cols != game.width or ws.rows != game.height) {
+                game.width = ws.cols;
+                game.height = ws.rows;
+                game.pickScale();
+                writeAll(STDOUT_FD, "\x1b[2J");
+            }
         }
 
-        // fixed timestep update: consume acc
-        // We want 1 game update per frame (60hz). So if acc >= FRAME_NS, update once.
-        // To keep physics stable at 60, do while acc >= FRAME_NS { update; acc-=FRAME_NS }
-        // But for smooth rendering, we update at least once per loop.
-        var updated = false;
         while (acc >= FRAME_NS) : (acc -= FRAME_NS) {
-            game.update(jump, duck, duck_hold);
-            // after first update, clear jump/duck edge (jump is edge-triggered)
+            game.update(jump, input_state.duck_held);
             jump = false;
-            duck = false;
-            // duck_hold stays? For hold we want continuous, so keep true if still holding
-            // but we cleared – for simplicity after first, duck_hold remains as last
-            // but we already consumed timer, so fine
-            updated = true;
-        }
-        // if no fixed update yet (acc < FRAME_NS) still render at display rate?
-        // We'll ensure at least one update if none happened and time passed small
-        if (!updated and game.state == .playing) {
-            // optional: interpolate? we just don't update
         }
 
-        // render each loop (throttled to ~60fps via sleep)
         try render(&game, &frame_buf);
         writeAll(STDOUT_FD, frame_buf.items);
 
-        // sleep to maintain target fps
         const after_render: i128 = nowNs();
         const elapsed = after_render - now;
         const target: i128 = @intCast(FRAME_NS);
         if (elapsed < target) {
             const sleep_ns: u64 = @intCast(target - elapsed);
-            {
-                var ts: c.timespec = .{ .sec = @intCast(sleep_ns / 1000000000), .nsec = @intCast(sleep_ns % 1000000000) };
-                _ = c.nanosleep(&ts, null);
-            }
+            var ts: c.timespec = .{ .sec = @intCast(sleep_ns / 1000000000), .nsec = @intCast(sleep_ns % 1000000000) };
+            _ = c.nanosleep(&ts, null);
         }
 
-        // beep on game over? Use terminal bell once
-        if (game.state == .game_over and game.frame % 60 == 1) {
-            // ring bell
+        // chrome plays the death sound once, and one blip per hundred points
+        const is_over = game.state == .game_over;
+        if (is_over and !was_over) writeAll(STDOUT_FD, "\x07");
+        was_over = is_over;
+        if (game.pending_beep) {
+            game.pending_beep = false;
             writeAll(STDOUT_FD, "\x07");
         }
+        if (game.pending_save) {
+            game.pending_save = false;
+            if (game.takeRun(true)) |run| history.append(run);
+        }
     }
-}
-
-fn bufAppend(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    try buf.appendSlice(alloc, s);
 }
