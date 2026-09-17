@@ -942,8 +942,8 @@ fn rectsOverlap(a: Rect, b: Rect) bool {
 // ---------------------------------------------------------------------------
 // Terminal helpers
 // ---------------------------------------------------------------------------
-const STDIN_FD: i32 = 0;
-const STDOUT_FD: i32 = 1;
+const STDIN_FD = 0;
+const STDOUT_FD = 1;
 
 fn nowNs() i128 {
     var ts: c.timespec = undefined;
@@ -1454,8 +1454,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = gpa.allocator();
 
     {
-        var args = std.process.Args.init(alloc, init.args);
-        defer args.deinit();
+        var args = std.process.Args.Iterator.init(init.args);
         _ = args.next(); // argv[0]
         if (args.next()) |cmd| {
             if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "stats")) return viewHistory(alloc);
