@@ -26,6 +26,14 @@ const CANVAS_DINO_WIDTHS: f32 = 13.6;
 
 const GROUND_ROW_FROM_BOTTOM: i32 = 3; // ground line sits at height - 3
 
+// chrome's distance meter counts round(distance * 0.025) in its own pixels, so
+// 100 points is ~11s of running and 700 (the night flip) is well over a minute
+const SCORE_PER_CHROME_PX: f32 = 0.025;
+const CHROME_DINO_W: f32 = 44.0;
+
+const FLASH_PHASE_FRAMES: u64 = 15; // 250ms, same as chrome
+const FLASH_PHASES: u64 = 6; // three on/off blinks
+
 // ---------------------------------------------------------------------------
 // Sprites
 //
@@ -365,7 +373,11 @@ const Game = struct {
     ducking: bool = false,
     frame: u64 = 0,
     score: u32 = 0,
+    score_f: f32 = 0,
     hi_score: u32 = 0,
+    flash_start: u64 = 0,
+    flashing: bool = false,
+    pending_beep: bool = false,
     speed: f32 = 1,
     ground_scroll: f32 = 0,
     allocator: std.mem.Allocator,
@@ -375,7 +387,7 @@ const Game = struct {
     dist_since_spawn: f32 = 0,
     blink: bool = false,
     rng: std.Random.DefaultPrng,
-    inverted: bool = false,
+    inverted: bool = true, // start at night; the flip at 700 goes to day
     // pixel canvas: width x (2 * height)
     px: []u8 = &.{},
     px_w: i32 = 0,
@@ -542,13 +554,16 @@ const Game = struct {
         self.ducking = false;
         self.frame = 0;
         self.score = 0;
+        self.score_f = 0;
+        self.flashing = false;
+        self.pending_beep = false;
         self.speed = self.baseSpeed();
         self.ground_scroll = 0;
         self.obstacles.clearRetainingCapacity();
         self.clouds.clearRetainingCapacity();
         self.dist_since_spawn = 0;
         self.next_spawn_dist = self.speed * 90;
-        self.inverted = false;
+        self.inverted = true;
         var i: usize = 0;
         while (i < 3) : (i += 1) {
             self.spawnCloud(self.rng.random().intRangeAtMost(i32, 10, @max(11, self.width - 10)));
@@ -639,9 +654,23 @@ const Game = struct {
             self.speed += self.baseSpeed() * ACCEL_RATIO;
         }
 
-        self.score += 1;
+        // chrome counts round(distance * 0.025) in its own 44px-dino pixels;
+        // normalising by widthScale keeps scores comparable across terminals
+        const px_per_col = CHROME_DINO_W / @as(f32, @floatFromInt(self.dinoW()));
+        const prev = self.score;
+        self.score_f += self.speed * px_per_col / self.widthScale() * SCORE_PER_CHROME_PX;
+        self.score = @intFromFloat(self.score_f);
         if (self.score > self.hi_score) self.hi_score = self.score;
-        if (self.score % 700 == 0 and self.score != 0) self.inverted = !self.inverted;
+
+        if (self.score / 100 != prev / 100 and self.score != 0) {
+            self.flashing = true;
+            self.flash_start = self.frame;
+            self.pending_beep = true;
+        }
+        if (self.score / 700 != prev / 700 and self.score != 0) self.inverted = !self.inverted;
+        if (self.flashing and self.frame - self.flash_start >= FLASH_PHASE_FRAMES * FLASH_PHASES) {
+            self.flashing = false;
+        }
 
         self.ground_scroll += self.speed;
         self.moveClouds(self.speed * 0.15);
@@ -672,6 +701,12 @@ const Game = struct {
                 break;
             }
         }
+    }
+
+    /// Chrome blinks the meter three times when you pass a hundred.
+    fn scoreVisible(self: *Game) bool {
+        if (!self.flashing) return true;
+        return ((self.frame - self.flash_start) / FLASH_PHASE_FRAMES) % 2 == 0;
     }
 
     fn moveClouds(self: *Game, dx: f32) void {
@@ -962,14 +997,25 @@ fn pollInput(st: *InputState) Input {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+/// Chrome paints its own canvas, so day is light with dark sprites and the
+/// night flip inverts both. Painting the background is what makes the flip
+/// visible at all - sprite colours alone do nothing on a dark terminal.
+fn bgCode(inverted: bool) []const u8 {
+    return if (inverted) "\x1b[48;5;233m" else "\x1b[48;5;255m";
+}
+
 fn colorCode(id: u8, inverted: bool) []const u8 {
-    if (inverted) return "\x1b[97m";
-    return switch (id) {
-        C_DINO => "\x1b[38;5;252m", // chrome's #535353 reads as light grey on a dark terminal
+    if (inverted) return switch (id) {
         C_CACTUS => "\x1b[38;5;108m",
         C_CLOUD => "\x1b[38;5;240m",
-        C_GROUND => "\x1b[38;5;245m",
-        else => "\x1b[37m",
+        else => "\x1b[38;5;253m",
+    };
+    return switch (id) {
+        C_DINO => "\x1b[38;5;240m", // chrome's #535353
+        C_CACTUS => "\x1b[38;5;65m",
+        C_CLOUD => "\x1b[38;5;249m",
+        C_GROUND => "\x1b[38;5;240m",
+        else => "\x1b[38;5;240m",
     };
 }
 
@@ -1019,6 +1065,7 @@ fn compose(game: *Game) void {
 
 /// Flush the pixel canvas as half-block characters.
 fn emit(game: *Game, buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
+    const bg = bgCode(game.inverted);
     var cur: u8 = 0;
     var r: i32 = 0;
     while (r < game.height) : (r += 1) {
@@ -1030,6 +1077,8 @@ fn emit(game: *Game, buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
             if (game.getPx(x, top_y) != 0 or game.getPx(x, bot_y) != 0) last = x;
         }
         try moveTo(buf, alloc, r, 0);
+        try buf.appendSlice(alloc, bg);
+        cur = 0;
         x = 0;
         while (x <= last) : (x += 1) {
             const t = game.getPx(x, top_y);
@@ -1051,9 +1100,9 @@ fn emit(game: *Game, buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
                 try buf.appendSlice(alloc, "\u{2584}");
             }
         }
+        // erase-to-end fills with the background we just set
         try buf.appendSlice(alloc, "\x1b[K");
     }
-    try buf.appendSlice(alloc, "\x1b[0m");
 }
 
 fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
@@ -1064,19 +1113,18 @@ fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
     const w = game.width;
     const h = game.height;
 
-    const fg = if (game.inverted) "\x1b[97m" else "\x1b[90m";
-    const dim = "\x1b[2m";
+    const bg = bgCode(game.inverted);
+    const ink = colorCode(C_DINO, game.inverted);
+    const faint = if (game.inverted) "\x1b[38;5;242m" else "\x1b[38;5;248m";
     const reset = "\x1b[0m";
 
     if (w < 40 or h < 14) {
         try clearScreen(buf, alloc);
-        try buf.appendSlice(alloc, fg);
         const msg = " TERMINAL TOO SMALL - enlarge to play ";
         const row = @divFloor(h, 2);
         const col = @max(0, @divFloor(w - @as(i32, @intCast(msg.len)), 2));
         try moveTo(buf, alloc, row, col);
         try buf.appendSlice(alloc, msg);
-        try buf.appendSlice(alloc, reset);
         return;
     }
 
@@ -1084,78 +1132,59 @@ fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
     compose(game);
     try emit(game, buf, alloc);
 
-    // ---- score header (top right) ----
+    // every overlay repaints the background, otherwise it punches a hole in the
+    // canvas with the terminal's own colours
+    const label = struct {
+        fn at(b: *std.ArrayList(u8), a: std.mem.Allocator, bgc: []const u8, fgc: []const u8, row: i32, col: i32, text: []const u8) !void {
+            try moveTo(b, a, row, @max(0, col));
+            try b.appendSlice(a, bgc);
+            try b.appendSlice(a, fgc);
+            try b.appendSlice(a, text);
+        }
+        fn centered(b: *std.ArrayList(u8), a: std.mem.Allocator, bgc: []const u8, fgc: []const u8, row: i32, width: i32, text: []const u8) !void {
+            const col = @divFloor(width - @as(i32, @intCast(text.len)), 2);
+            try at(b, a, bgc, fgc, row, col, text);
+        }
+    };
+
+    // ---- score header (top right), blinking on every hundred ----
     {
         var score_buf: [32]u8 = undefined;
-        const score_str = try std.fmt.bufPrint(&score_buf, "{d:0>5}", .{game.score});
         var hi_buf: [32]u8 = undefined;
-        const hi_str = try std.fmt.bufPrint(&hi_buf, "{d:0>5}", .{game.hi_score});
-        const header = try std.fmt.allocPrint(alloc, "HI {s}  {s}", .{ hi_str, score_str });
-        defer alloc.free(header);
-        try buf.appendSlice(alloc, fg);
-        try buf.appendSlice(alloc, dim);
-        const col = w - @as(i32, @intCast(header.len)) - 2;
-        try moveTo(buf, alloc, 0, col);
-        try buf.appendSlice(alloc, header);
-        try buf.appendSlice(alloc, reset);
+        const score_str = try std.fmt.bufPrint(&score_buf, "{d:0>5}", .{game.score});
+        const hi_str = try std.fmt.bufPrint(&hi_buf, "HI {d:0>5}", .{game.hi_score});
+
+        const col = w - @as(i32, @intCast(hi_str.len + score_str.len)) - 4;
+        try label.at(buf, alloc, bg, faint, 0, col, hi_str);
+        if (game.scoreVisible()) {
+            try label.at(buf, alloc, bg, ink, 0, col + @as(i32, @intCast(hi_str.len)) + 2, score_str);
+        }
     }
 
     // ---- UI overlays ----
     if (game.state == .idle) {
-        const msg = if (game.blink) "  Press SPACE / UP to start  " else "                             ";
-        const hint = "  DOWN to duck | Q to quit  ";
-        const r1 = @divFloor(h, 2) + 2;
-        const c1 = @max(0, @divFloor(w - @as(i32, @intCast(msg.len)), 2));
-        const c2 = @max(0, @divFloor(w - @as(i32, @intCast(hint.len)), 2));
-        try buf.appendSlice(alloc, "\x1b[97;1m");
-        try moveTo(buf, alloc, r1, c1);
-        try buf.appendSlice(alloc, msg);
-        try buf.appendSlice(alloc, reset);
-        try buf.appendSlice(alloc, dim);
-        try moveTo(buf, alloc, r1 + 1, c2);
-        try buf.appendSlice(alloc, hint);
-        try buf.appendSlice(alloc, reset);
-
-        const title = " CHROME DINO ";
-        const title_col = @max(0, @divFloor(w - @as(i32, @intCast(title.len)), 2));
-        try moveTo(buf, alloc, 2, title_col);
-        try buf.appendSlice(alloc, "\x1b[1m");
-        try buf.appendSlice(alloc, title);
-        try buf.appendSlice(alloc, reset);
+        try label.centered(buf, alloc, bg, ink, 2, w, " CHROME DINO ");
+        if (game.blink) {
+            try label.centered(buf, alloc, bg, ink, @divFloor(h, 2) + 2, w, "Press SPACE / UP to start");
+        }
+        try label.centered(buf, alloc, bg, faint, @divFloor(h, 2) + 3, w, "DOWN to duck  |  Q to quit");
     } else if (game.state == .game_over) {
-        const over = " G A M E  O V E R ";
-        const over_col = @max(0, @divFloor(w - @as(i32, @intCast(over.len)), 2));
-        const r = @divFloor(h, 2) - 3;
-        try moveTo(buf, alloc, r, over_col);
-        try buf.appendSlice(alloc, "\x1b[91;1m");
-        try buf.appendSlice(alloc, over);
-        try buf.appendSlice(alloc, reset);
+        const mid = @divFloor(h, 2);
+        try label.centered(buf, alloc, bg, ink, @max(0, mid - 3), w, "G A M E   O V E R");
 
-        const score_msg = try std.fmt.allocPrint(alloc, " Score: {d}  HI: {d} ", .{ game.score, game.hi_score });
-        defer alloc.free(score_msg);
-        const sc_col = @max(0, @divFloor(w - @as(i32, @intCast(score_msg.len)), 2));
-        try moveTo(buf, alloc, r + 1, sc_col);
-        try buf.appendSlice(alloc, dim);
-        try buf.appendSlice(alloc, score_msg);
-        try buf.appendSlice(alloc, reset);
+        var sc_buf: [64]u8 = undefined;
+        const sc = try std.fmt.bufPrint(&sc_buf, "{d:0>5}   HI {d:0>5}", .{ game.score, game.hi_score });
+        try label.centered(buf, alloc, bg, faint, @max(1, mid - 1), w, sc);
 
-        const restart = if (game.blink) " Press SPACE or R to restart " else "                             ";
-        const rc = @max(0, @divFloor(w - @as(i32, @intCast(restart.len)), 2));
-        try moveTo(buf, alloc, r + 3, rc);
-        try buf.appendSlice(alloc, "\x1b[97;1m");
-        try buf.appendSlice(alloc, restart);
-        try buf.appendSlice(alloc, reset);
+        try label.centered(buf, alloc, bg, faint, mid + 2, w, "SPACE or R to restart  |  Q to quit");
     }
 
-    if (game.state == .playing and w > 40) {
-        const footer = "SPACE/UP jump  DOWN duck  Q quit";
-        const fc = @max(0, w - @as(i32, @intCast(footer.len)) - 1);
-        try moveTo(buf, alloc, h - 1, fc);
-        try buf.appendSlice(alloc, "\x1b[90;2m");
-        try buf.appendSlice(alloc, footer);
-        try buf.appendSlice(alloc, reset);
+    if (game.state == .playing and w > 44) {
+        const footer = "SPACE/UP jump   DOWN duck   Q quit";
+        try label.at(buf, alloc, bg, faint, h - 1, w - @as(i32, @intCast(footer.len)) - 1, footer);
     }
 
+    try buf.appendSlice(alloc, reset);
     try moveTo(buf, alloc, h - 1, 0);
 }
 
@@ -1312,9 +1341,13 @@ pub fn main() !void {
             _ = c.nanosleep(&ts, null);
         }
 
-        // chrome plays the death sound once, not on a loop
+        // chrome plays the death sound once, and one blip per hundred points
         const is_over = game.state == .game_over;
         if (is_over and !was_over) writeAll(STDOUT_FD, "\x07");
         was_over = is_over;
+        if (game.pending_beep) {
+            game.pending_beep = false;
+            writeAll(STDOUT_FD, "\x07");
+        }
     }
 }
