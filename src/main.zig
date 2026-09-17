@@ -31,6 +31,7 @@ const GROUND_ROW_FROM_BOTTOM: i32 = 3; // ground line sits at height - 3
 const SCORE_PER_CHROME_PX: f32 = 0.025;
 const CHROME_DINO_W: f32 = 44.0;
 
+const INTRO_FRAMES: i32 = 45; // ground slides in, dino runs on from the left
 const FLASH_PHASE_FRAMES: u64 = 15; // 250ms, same as chrome
 const FLASH_PHASES: u64 = 6; // three on/off blinks
 
@@ -288,6 +289,21 @@ const PTERO_B = [_][]const u8{
     "......#####.....",
 };
 
+// restart button - chrome's circular arrow, shown on the game over screen
+const RESTART = [_][]const u8{
+    "....####....",
+    "..##....##..",
+    ".##......###",
+    "##........##",
+    "##........##",
+    "##........##",
+    "##........##",
+    "##........##",
+    ".##......##.",
+    "..##....##..",
+    "....####....",
+};
+
 // cloud - chrome draws it as an outline
 const CLOUD = [_][]const u8{
     "....######....",
@@ -336,6 +352,60 @@ fn artH(art: Art, half: bool) i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Collision boxes
+//
+// One rectangle around a t-rex is mostly empty space - the snout is top right,
+// the tail is mid left - so corners kill you unfairly. Chrome splits each
+// sprite into a handful of boxes instead; these are the same idea, in sprite
+// pixel coordinates.
+// ---------------------------------------------------------------------------
+const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+const DINO_BOXES = [_]Rect{
+    .{ .x = 10, .y = 0, .w = 10, .h = 8 }, // head and snout
+    .{ .x = 7, .y = 7, .w = 8, .h = 4 }, // neck and chest
+    .{ .x = 3, .y = 10, .w = 13, .h = 5 }, // torso, arm, tail root
+    .{ .x = 5, .y = 14, .w = 9, .h = 6 }, // legs
+};
+
+const DINO_DUCK_BOXES = [_]Rect{
+    .{ .x = 16, .y = 0, .w = 10, .h = 6 },
+    .{ .x = 1, .y = 6, .w = 20, .h = 3 },
+    .{ .x = 5, .y = 9, .w = 10, .h = 3 },
+};
+
+const CACTUS_SMALL_BOXES = [_]Rect{
+    .{ .x = 4, .y = 0, .w = 2, .h = 14 },
+    .{ .x = 1, .y = 4, .w = 2, .h = 4 },
+    .{ .x = 7, .y = 6, .w = 2, .h = 4 },
+};
+
+const CACTUS_LARGE_BOXES = [_]Rect{
+    .{ .x = 5, .y = 0, .w = 3, .h = 20 },
+    .{ .x = 1, .y = 5, .w = 3, .h = 6 },
+    .{ .x = 9, .y = 7, .w = 3, .h = 6 },
+};
+
+const PTERO_BOXES = [_]Rect{
+    .{ .x = 0, .y = 3, .w = 6, .h = 3 }, // beak and head
+    .{ .x = 5, .y = 2, .w = 10, .h = 5 }, // body
+};
+
+/// Sprite-space box to screen-pixel box; at half scale it has to round outward
+/// so a box never shrinks to nothing.
+fn scaleRect(b: Rect, half: bool) Rect {
+    if (!half) return b;
+    const x = @divTrunc(b.x, 2);
+    const y = @divTrunc(b.y, 2);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(1, @divTrunc(b.x + b.w + 1, 2) - x),
+        .h = @max(1, @divTrunc(b.y + b.h + 1, 2) - y),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 const ObstacleKind = enum { cactus_small, cactus_large, ptero };
@@ -375,6 +445,7 @@ const Game = struct {
     score: u32 = 0,
     score_f: f32 = 0,
     hi_score: u32 = 0,
+    intro: i32 = 0,
     flash_start: u64 = 0,
     flashing: bool = false,
     pending_beep: bool = false,
@@ -463,13 +534,33 @@ const Game = struct {
         return (self.height - GROUND_ROW_FROM_BOTTOM) * 2;
     }
 
+    /// Column the dino stands in. During the intro it runs on from off-screen.
+    fn dinoX(self: *Game) i32 {
+        if (self.intro <= 0) return DINO_X;
+        const slide_frames: i32 = @divTrunc(INTRO_FRAMES * 2, 3);
+        const done = INTRO_FRAMES - self.intro;
+        if (done >= slide_frames) return DINO_X;
+        const start = -self.dinoW();
+        const t = @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(slide_frames));
+        const span: f32 = @floatFromInt(DINO_X - start);
+        return start + @as(i32, @intFromFloat(@round(span * t)));
+    }
+
+    /// How much of the ground has slid in during the intro, in columns.
+    fn introGroundW(self: *Game) i32 {
+        if (self.intro <= 0) return self.width;
+        const done = INTRO_FRAMES - self.intro;
+        const t = @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(INTRO_FRAMES));
+        return @intFromFloat(@round(@as(f32, @floatFromInt(self.width)) * t));
+    }
+
     fn dinoArt(self: *Game) Art {
         if (self.state == .game_over) return &DINO_DEAD;
         if (!self.on_ground) return &DINO_JUMP;
         if (self.ducking) {
             return if ((self.frame / 6) % 2 == 0) @as(Art, &DINO_DUCK_A) else @as(Art, &DINO_DUCK_B);
         }
-        if (self.state == .idle) {
+        if (self.state == .idle and self.intro <= 0) {
             return if (self.blink and (self.frame / 20) % 8 == 0) @as(Art, &DINO_BLINK) else @as(Art, &DINO_IDLE);
         }
         return if ((self.frame / 6) % 2 == 0) @as(Art, &DINO_RUN_A) else @as(Art, &DINO_RUN_B);
@@ -484,19 +575,16 @@ const Game = struct {
         return base + @as(i32, @intFromFloat(@floor(self.dino_y)));
     }
 
-    const Box = struct { x: i32, y: i32, w: i32, h: i32 };
+    fn dinoBoxes(self: *Game) []const Rect {
+        return if (self.ducking and self.on_ground) &DINO_DUCK_BOXES else &DINO_BOXES;
+    }
 
-    fn dinoHitbox(self: *Game) Box {
-        const art = self.dinoArt();
-        const top = self.dinoTopPy(art);
-        const w = artW(art, self.half);
-        const h = artH(art, self.half);
-        // trim the tail, the snout tip and the feet a little
-        const ix = @divTrunc(w * 3, 20);
-        const iw = @max(1, @divTrunc(w * 13, 20));
-        const iy = @divTrunc(h, 10);
-        const ih = @max(1, h - iy - @divTrunc(h, 12));
-        return .{ .x = DINO_X + ix, .y = top + iy, .w = iw, .h = ih };
+    fn obstacleBoxes(_: *Game, o: Obstacle) []const Rect {
+        return switch (o.kind) {
+            .cactus_small => &CACTUS_SMALL_BOXES,
+            .cactus_large => &CACTUS_LARGE_BOXES,
+            .ptero => &PTERO_BOXES,
+        };
     }
 
     fn obstacleArt(self: *Game, o: Obstacle) Art {
@@ -531,18 +619,33 @@ const Game = struct {
         return bottom - lift - h + 1;
     }
 
-    fn obstacleHitbox(self: *Game, o: Obstacle) Box {
-        const art = self.obstacleArt(o);
-        const h = artH(art, self.half);
+    /// Cheap whole-sprite test first, then chrome's per-box pass.
+    fn collides(self: *Game, o: Obstacle) bool {
+        const dart = self.dinoArt();
+        const dx = self.dinoX();
+        const dy = self.dinoTopPy(dart);
+        const oart = self.obstacleArt(o);
         const ox: i32 = @intFromFloat(@round(o.x));
-        const w = self.obstacleW(o);
-        const iy = @max(1, @divTrunc(h, 10));
-        return .{
-            .x = ox + 1,
-            .y = self.obstacleTopPy(o) + iy,
-            .w = @max(1, w - 2),
-            .h = @max(1, h - iy),
-        };
+        const oy = self.obstacleTopPy(o);
+
+        const dino_rect: Rect = .{ .x = dx, .y = dy, .w = artW(dart, self.half), .h = artH(dart, self.half) };
+        const obs_rect: Rect = .{ .x = ox, .y = oy, .w = self.obstacleW(o), .h = artH(oart, self.half) };
+        if (!rectsOverlap(dino_rect, obs_rect)) return false;
+
+        const step = artW(oart, self.half) + self.cactusGap();
+        for (self.dinoBoxes()) |raw_a| {
+            const ba = scaleRect(raw_a, self.half);
+            const a: Rect = .{ .x = dx + ba.x, .y = dy + ba.y, .w = ba.w, .h = ba.h };
+            var n: i32 = 0;
+            while (n < @as(i32, @intCast(o.count))) : (n += 1) {
+                for (self.obstacleBoxes(o)) |raw_b| {
+                    const bb = scaleRect(raw_b, self.half);
+                    const b: Rect = .{ .x = ox + n * step + bb.x, .y = oy + bb.y, .w = bb.w, .h = bb.h };
+                    if (rectsOverlap(a, b)) return true;
+                }
+            }
+        }
+        return false;
     }
 
     // -- lifecycle ---------------------------------------------------------
@@ -555,6 +658,7 @@ const Game = struct {
         self.frame = 0;
         self.score = 0;
         self.score_f = 0;
+        self.intro = 0;
         self.flashing = false;
         self.pending_beep = false;
         self.speed = self.baseSpeed();
@@ -575,6 +679,7 @@ const Game = struct {
         self.state = .playing;
         self.frame = 0;
         self.speed = self.baseSpeed();
+        self.intro = INTRO_FRAMES;
     }
 
     fn spawnCloud(self: *Game, at_x: i32) void {
@@ -631,6 +736,14 @@ const Game = struct {
         }
 
         if (self.state == .game_over) return;
+
+        // intro: the ground slides in and the dino runs on, nothing else yet
+        if (self.intro > 0) {
+            self.intro -= 1;
+            self.ground_scroll += self.speed;
+            self.moveClouds(self.speed * 0.15);
+            return;
+        }
 
         if (want_jump and self.on_ground and !self.ducking) {
             self.dino_vy = self.jumpVel();
@@ -694,9 +807,8 @@ const Game = struct {
             self.spawnObstacle();
         }
 
-        const dbox = self.dinoHitbox();
         for (self.obstacles.items) |o| {
-            if (boxesOverlap(dbox, self.obstacleHitbox(o))) {
+            if (self.collides(o)) {
                 self.state = .game_over;
                 break;
             }
@@ -762,7 +874,7 @@ const Game = struct {
     }
 };
 
-fn boxesOverlap(a: Game.Box, b: Game.Box) bool {
+fn rectsOverlap(a: Rect, b: Rect) bool {
     return a.x < b.x + b.w and a.x + a.w > b.x and a.y < b.y + b.h and a.y + a.h > b.y;
 }
 
@@ -1034,8 +1146,9 @@ fn compose(game: *Game) void {
     // ground: one solid line plus chrome's scattered pebbles
     {
         const scroll: i32 = @intFromFloat(@floor(game.ground_scroll));
+        const ground_w = game.introGroundW();
         var x: i32 = 0;
-        while (x < game.width) : (x += 1) {
+        while (x < ground_w) : (x += 1) {
             game.setPx(x, gpy, C_GROUND);
             const p = @mod(x + scroll, 43);
             if (p == 0 or p == 1) game.setPx(x, gpy - 1, C_GROUND);
@@ -1059,7 +1172,15 @@ fn compose(game: *Game) void {
     // dino
     {
         const art = game.dinoArt();
-        game.blit(art, DINO_X, game.dinoTopPy(art), C_DINO);
+        game.blit(art, game.dinoX(), game.dinoTopPy(art), C_DINO);
+    }
+
+    // chrome's restart button, on the game over screen
+    if (game.state == .game_over) {
+        const iw = artW(&RESTART, game.half);
+        const ix = @divFloor(game.width - iw, 2);
+        const iy = (@divFloor(game.height, 2) - 3) * 2; // sits above the dino
+        game.blit(&RESTART, ix, iy, C_DINO);
     }
 }
 
@@ -1170,13 +1291,15 @@ fn render(game: *Game, buf: *std.ArrayList(u8)) !void {
         try label.centered(buf, alloc, bg, faint, @divFloor(h, 2) + 3, w, "DOWN to duck  |  Q to quit");
     } else if (game.state == .game_over) {
         const mid = @divFloor(h, 2);
-        try label.centered(buf, alloc, bg, ink, @max(0, mid - 3), w, "G A M E   O V E R");
+        try label.centered(buf, alloc, bg, ink, @max(0, mid - 6), w, "G A M E   O V E R");
 
         var sc_buf: [64]u8 = undefined;
         const sc = try std.fmt.bufPrint(&sc_buf, "{d:0>5}   HI {d:0>5}", .{ game.score, game.hi_score });
-        try label.centered(buf, alloc, bg, faint, @max(1, mid - 1), w, sc);
+        try label.centered(buf, alloc, bg, faint, @max(1, mid - 4), w, sc);
 
-        try label.centered(buf, alloc, bg, faint, mid + 2, w, "SPACE or R to restart  |  Q to quit");
+        // the restart icon itself is drawn into the canvas by compose(); the
+        // hint goes to the footer so nothing sits on top of the playfield
+        try label.at(buf, alloc, bg, faint, h - 1, 1, "SPACE or R to restart   Q to quit");
     }
 
     if (game.state == .playing and w > 44) {
